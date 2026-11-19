@@ -67,3 +67,16 @@ describe('assembly document', () => {
     expect(history.document.placed.map((p) => p.partId)).toEqual(['a', 'c']);
   });
 });
+
+describe('history replace', () => {
+  it('adjusting the last step keeps it one undo step', () => {
+    const history = new History(emptyDocument());
+    history.commit(addParts(history.document, { partId: 'a', transforms: [identityTransform()], parentId: null, joint: null }).doc);
+    const id = history.document.placed[0].id;
+    history.commit(movePart(history.document, id, at(10, 0, 0)));
+    history.replace(movePart(history.document, id, at(12, 0, 0)));
+    expect(requirePlaced(history.document, id).transform.position).toEqual([12, 0, 0]);
+    expect(history.undo()).toBe(true);
+    expect(requirePlaced(history.document, id).transform.position).toEqual([0, 0, 0]);
+  });
+});

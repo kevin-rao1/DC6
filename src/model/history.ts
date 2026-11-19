@@ -25,6 +25,14 @@ export class History {
     this.future = [];
   }
 
+  // Replace the current document without adding an undo step: used when the
+  // user adjusts the last operation (typing an exact value after a drag), so
+  // the drag and its adjustment undo together.
+  replace(next: AssemblyDocument): void {
+    this.current = cloneDocument(next);
+    this.future = [];
+  }
+
   canUndo(): boolean {
     return this.past.length > 0;
   }
