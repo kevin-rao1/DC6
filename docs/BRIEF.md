@@ -13,7 +13,7 @@ In version 2 the user builds the rocket in DC6, the way a rocket is built in the
 
 ### The rocket lies on its side
 
-Livery has to read correctly when the rocket is pitched 90° from vertical, so DC6 shows the rocket horizontal everywhere: nose to the right, in the 3D view and on the flat page. Lettering placed the natural way then comes out the right way up, and never upside down by accident.
+Livery has to read correctly when the rocket is pitched 90° from vertical, so DC6 shows the rocket horizontal everywhere: nose to the left as in OpenRocket, in the 3D view and on the flat page. Lettering placed the natural way then comes out the right way up, and never upside down by accident.
 
 The window is split top and bottom: 3D view above, flat page below, both the full width of the window, with a draggable divider. This replaces the left and right split and the "nose up" rule of version 1.
 
@@ -43,7 +43,7 @@ As version 1, section 4.4: drag in an SVG, it sticks to the surface under the cu
 
 The page beside the 3D view shows the rocket laid flat, built from the assembly:
 
-* Parts stacked on the axis are unrolled around it into one body strip, nose to the right, 1:1 in millimetres. Only what can be seen from the side is drawn, so a spigot covered by the next section does not appear.
+* Parts stacked on the axis are unrolled around it into one body strip, nose to the left, 1:1 in millimetres. Only what can be seen from the side is drawn, so a spigot covered by the next section does not appear.
 * Each part attached to the side (a fin, a canard, a pod) gets its own islands above and below the strip, at the station where it is attached, one per side for flat parts.
 * The seam, wrapping, gores, layout and scale rules of version 1 (4.3.4 to 4.3.6) stand.
 
