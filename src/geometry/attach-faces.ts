@@ -21,8 +21,11 @@
 //    the tip of the internals, not on the shell rim the user wants to mate.
 //    So every flat CAD face bounded by a circle of large radius also offers a
 //    disc (centre, normal, radius of that circle), when
+//      - the face's edges go at least 90% of the way round the circle,
 //      - the radius is at least 60% of the largest such circle on the part
-//        and at least 3 mm (small holes and bosses offer nothing), and
+//        and at least 3 mm (small holes and bosses offer nothing),
+//      - the rim is on the outside: rays outward in the disc plane from just
+//        beyond the rim leave the part (a ledge inside a cavity fails), and
 //      - the face is open to the outside along its normal: from at least 25%
 //        of sample points on the face, a ray along the normal leaves the part
 //        without hitting it. A groove side wall faces the opposite wall and
@@ -47,6 +50,9 @@ export const minimumContactFraction = 0.01;
 export const featureRadiusFraction = 0.6;
 export const minimumFeatureRadius = 3;
 export const minimumClearFraction = 0.25;
+// A face's circular edges must go at least this far round (as a fraction of
+// a full turn) for the circle to count.
+export const minimumCircleCoverage = 0.9;
 export const maxCandidates = 12;
 
 // Hull triangles within this distance of a facet plane belong to it. The
@@ -62,7 +68,7 @@ export interface AttachInput {
   indices: Uint32Array;
   triangleFace: Uint32Array;
   faces: CadFace[];
-  edges: Array<{ circle: { centre: Vec3; axis: Vec3; radius: number } | null }>;
+  edges: Array<{ circle: { centre: Vec3; axis: Vec3; radius: number; span: number } | null }>;
   hullPoints: Float64Array;
   hullTriangles: Uint32Array;
   bvh: Bvh;
@@ -241,11 +247,25 @@ function fitCircle(outline: Array<[number, number]>): { centre: [number, number]
     return null;
   }
   const radius = Math.sqrt(radiusSquared);
+  const angles: number[] = [];
   for (let i = 0; i < n; i++) {
     const d = Math.hypot(outline[i][0] - a, outline[i][1] - b);
     if (Math.abs(d - radius) > 0.02 * radius) {
       return null;
     }
+    angles.push(Math.atan2(outline[i][1] - b, outline[i][0] - a));
+  }
+  // The points must go round the circle, not bunch at a few places: the
+  // corners of a long thin rectangle also lie on a circle.
+  angles.sort(function ascending(p, q) {
+    return p - q;
+  });
+  let widestGap = angles[0] + 2 * Math.PI - angles[angles.length - 1];
+  for (let i = 1; i < angles.length; i++) {
+    widestGap = Math.max(widestGap, angles[i] - angles[i - 1]);
+  }
+  if (widestGap > Math.PI / 6) {
+    return null;
   }
   return { centre: [a, b], radius: radius };
 }
@@ -274,20 +294,20 @@ function solve3(m: number[][], r: number[]): number[] | null {
   return result;
 }
 
-// Direction in the plane along which the outline is longest: the line through
-// the two outline points farthest apart.
+// Direction in the plane along which the outline is long: the direction of
+// its longest edge. For a fin root (a long thin strip) that is the root
+// chord. (The farthest pair of points would give the diagonal instead.)
 function longestDirection(frame: PlaneFrame, outline: Array<[number, number]>): Vec3 {
   let best = -1;
   let direction: [number, number] = [1, 0];
   for (let i = 0; i < outline.length; i++) {
-    for (let k = i + 1; k < outline.length; k++) {
-      const dx = outline[k][0] - outline[i][0];
-      const dy = outline[k][1] - outline[i][1];
-      const d = dx * dx + dy * dy;
-      if (d > best) {
-        best = d;
-        direction = [dx, dy];
-      }
+    const next = outline[(i + 1) % outline.length];
+    const dx = next[0] - outline[i][0];
+    const dy = next[1] - outline[i][1];
+    const d = dx * dx + dy * dy;
+    if (d > best) {
+      best = d;
+      direction = [dx, dy];
     }
   }
   const world = add(scale(frame.u, direction[0]), scale(frame.v, direction[1]));
@@ -469,7 +489,11 @@ export function featureDiscs(input: AttachInput): AttachFace[] {
     if (!face.flat || face.flatNormal === null) {
       continue;
     }
-    let best: Found | null = null;
+    // Group the face's circular edges by circle (CAD often splits a circle
+    // into two or more arcs) and keep circles the face's edges go nearly all
+    // the way round. A fin's trailing edge face meeting the tube has an arc
+    // of the tube's radius, but only a few degrees of it.
+    const circles: Array<{ centre: Vec3; radius: number; span: number }> = [];
     for (let k = 0; k < face.edges.length; k++) {
       const circle = input.edges[face.edges[k]].circle;
       if (circle === null) {
@@ -478,8 +502,26 @@ export function featureDiscs(input: AttachInput): AttachFace[] {
       if (Math.abs(dot(circle.axis, face.flatNormal)) < 0.999) {
         continue;
       }
-      if (best === null || circle.radius > best.radius) {
-        best = { face: f, centre: circle.centre, normal: face.flatNormal, radius: circle.radius };
+      let joined = false;
+      for (let c = 0; c < circles.length; c++) {
+        const sameCentre = length(sub(circles[c].centre, circle.centre)) < 1e-3;
+        const sameRadius = Math.abs(circles[c].radius - circle.radius) < 1e-3;
+        if (sameCentre && sameRadius) {
+          circles[c].span = circles[c].span + circle.span;
+          joined = true;
+        }
+      }
+      if (!joined) {
+        circles.push({ centre: circle.centre, radius: circle.radius, span: circle.span });
+      }
+    }
+    let best: Found | null = null;
+    for (let c = 0; c < circles.length; c++) {
+      if (circles[c].span < minimumCircleCoverage * 2 * Math.PI) {
+        continue;
+      }
+      if (best === null || circles[c].radius > best.radius) {
+        best = { face: f, centre: circles[c].centre, normal: face.flatNormal, radius: circles[c].radius };
       }
     }
     if (best !== null) {
@@ -495,6 +537,9 @@ export function featureDiscs(input: AttachInput): AttachFace[] {
       continue;
     }
     if (clearFraction(input, candidate.face, candidate.normal) < minimumClearFraction) {
+      continue;
+    }
+    if (!rimIsOutside(input, candidate.centre, candidate.normal, candidate.radius)) {
       continue;
     }
     const frame = planeFrame(candidate.centre, candidate.normal);
@@ -545,6 +590,26 @@ function clearFraction(input: AttachInput, faceIndex: number, normal: Vec3): num
     return 0;
   }
   return clear / samples;
+}
+
+// Is the disc's rim on the outside of the part? From just beyond the rim
+// (and just in front of the face), rays straight outward in the disc plane
+// must mostly leave the part. A ledge inside a cavity (the top of a nose's
+// bore, the top of a strut inside the can) has wall all round it and fails.
+function rimIsOutside(input: AttachInput, centre: Vec3, normal: Vec3, radius: number): boolean {
+  const frame = planeFrame(centre, normal);
+  const rays = 16;
+  let clear = 0;
+  for (let i = 0; i < rays; i++) {
+    const angle = (2 * Math.PI * i) / rays;
+    const outward = normalize(add(scale(frame.u, Math.cos(angle)), scale(frame.v, Math.sin(angle))));
+    const origin = add(add(centre, scale(outward, radius + 0.05)), scale(normal, 0.05));
+    const hit = raycast(input.bvh, input.positions, input.indices, origin, outward, Infinity);
+    if (hit === null) {
+      clear = clear + 1;
+    }
+  }
+  return clear >= rays / 2;
 }
 
 // Two candidates are the same place when their planes and centres coincide.
