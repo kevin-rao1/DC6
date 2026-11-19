@@ -1,0 +1,146 @@
+[
+  {
+    "file": "cylinder-two-halves.step",
+    "description": "Plain cylinder whose side is two half-cylinder faces",
+    "axis": [
+      0,
+      0,
+      1
+    ],
+    "axisPoint": [
+      0,
+      0,
+      0
+    ],
+    "noseKnown": false,
+    "unit": "MM",
+    "faceCount": 6,
+    "structure": "single"
+  },
+  {
+    "file": "cone.step",
+    "description": "Solid cone along +X, apex is the nose; written in inches",
+    "axis": [
+      1,
+      0,
+      0
+    ],
+    "axisPoint": [
+      -100,
+      20,
+      0
+    ],
+    "noseKnown": true,
+    "unit": "INCH",
+    "faceCount": 2,
+    "structure": "single"
+  },
+  {
+    "file": "ogive-nose.step",
+    "description": "Tangent ogive nose along -Y",
+    "axis": [
+      0,
+      -1,
+      0
+    ],
+    "axisPoint": [
+      0,
+      0,
+      0
+    ],
+    "noseKnown": true,
+    "unit": "MM",
+    "faceCount": 2,
+    "structure": "single"
+  },
+  {
+    "file": "spline-body.step",
+    "description": "Lofted body with a smooth spline profile (B-spline side face), off-axis",
+    "axis": [
+      0.5773502691896258,
+      0.5773502691896258,
+      0.5773502691896258
+    ],
+    "axisPoint": [
+      10,
+      20,
+      30
+    ],
+    "noseKnown": false,
+    "unit": "MM",
+    "faceCount": 3,
+    "structure": "single"
+  },
+  {
+    "file": "rocket-assembly.step",
+    "description": "Rocket as an assembly: nose, tube, boattail, 4 fins with root fillets, 4 canards",
+    "axis": [
+      0,
+      0,
+      1
+    ],
+    "axisPoint": [
+      0,
+      0,
+      0
+    ],
+    "noseKnown": true,
+    "unit": "MM",
+    "faceCount": 92,
+    "structure": "assembly"
+  },
+  {
+    "file": "rocket-fused.step",
+    "description": "The same rocket as one fused solid, off-axis",
+    "axis": [
+      0.2683281572999747,
+      0.8944271909999159,
+      -0.35777087639996635
+    ],
+    "axisPoint": [
+      120,
+      -40,
+      60
+    ],
+    "noseKnown": true,
+    "unit": "MM",
+    "faceCount": 70,
+    "structure": "single"
+  },
+  {
+    "file": "rocket-internals.step",
+    "description": "Hollow rocket with a motor tube and an avionics sled inside, axis +X",
+    "axis": [
+      1,
+      0,
+      0
+    ],
+    "axisPoint": [
+      0,
+      0,
+      0
+    ],
+    "noseKnown": true,
+    "unit": "MM",
+    "faceCount": 108,
+    "structure": "assembly"
+  },
+  {
+    "file": "rocket-long.step",
+    "description": "The assembly rocket with the body tube 10 mm longer",
+    "axis": [
+      0,
+      0,
+      1
+    ],
+    "axisPoint": [
+      0,
+      0,
+      0
+    ],
+    "noseKnown": true,
+    "unit": "MM",
+    "faceCount": 92,
+    "structure": "assembly"
+  }
+]

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>DC6 livery maker</title>
+  </head>
+  <body data-state="starting">
+    <header class="topbar">
+      <div class="brand">DC6</div>
+      <label class="button primary" for="file-input">Open STEP…</label>
+      <input id="file-input" type="file" accept=".step,.stp,.STEP,.STP" hidden />
+      <div id="status" class="status" data-testid="status">Starting…</div>
+    </header>
+    <main class="workspace">
+      <aside id="panel" class="panel">
+        <p class="muted">Open a STEP file, or drop one anywhere on the window.</p>
+      </aside>
+      <div id="split" class="split">
+        <section id="view-pane" class="pane view-pane">
+          <div id="viewer" class="viewer"></div>
+          <div class="view-toolbar">
+            <button class="button" data-view="side">Side</button>
+            <button class="button" data-view="top">Top</button>
+            <button class="button" data-view="nose">Nose-on</button>
+            <button class="button" data-view="tail">Tail-on</button>
+            <label class="checkbox"><input id="edges-toggle" type="checkbox" checked /> Edges</label>
+          </div>
+          <div id="loading" class="loading" hidden>
+            <div class="spinner"></div>
+            <div id="loading-text">Loading…</div>
+          </div>
+        </section>
+        <div id="divider" class="divider" role="separator" aria-orientation="vertical" tabindex="0" title="Drag to resize"></div>
+        <section id="page-pane" class="pane page-pane">
+          <div class="page-placeholder">
+            <div class="page-title">2D page</div>
+            <div class="muted">The unwrapped page arrives in stage 2.</div>
+          </div>
+        </section>
+      </div>
+    </main>
+    <div id="drop-overlay" class="drop-overlay" hidden>Drop a STEP file</div>
+    <script type="module" src="/src/app/main.ts"></script>
+  </body>
+</html>
