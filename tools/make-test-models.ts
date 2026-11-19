@@ -226,30 +226,26 @@ function solidOgive(radius: number, length: number): Shape {
   ]);
 }
 
-// Hollow ogive nose with a shoulder (spigot) below its base. Base at z = 0,
-// shoulder from z = -shoulderLength to 0, open at the aft end.
+// Hollow ogive nose, open at the base (z = 0), closed at the tip, with a
+// female thread inside its first 12 mm.
 function makeNose(): Shape {
   const outer = solidOgive(body.outerRadius, nose.length);
-  const shoulder = revolvePolygon([
-    [0, -nose.shoulderLength],
-    [nose.shoulderOuterRadius, -nose.shoulderLength],
-    [nose.shoulderOuterRadius, 0.5],
-    [0, 0.5],
-  ]);
-  const solid = fuse(outer, shoulder);
   const innerRadius = body.outerRadius - nose.wall;
-  // The cavity starts above a solid lip at the base, so that the shoulder and
-  // the ogive shell are joined by material and form one solid.
-  const innerOgive = solidOgive(innerRadius, nose.innerLength - nose.baseLip);
-  const inner = transformed(innerOgive, translation(0, 0, nose.baseLip));
-  const bore = revolvePolygon([
-    [0, -nose.shoulderLength - 1],
-    [nose.shoulderInnerRadius, -nose.shoulderLength - 1],
-    [nose.shoulderInnerRadius, nose.baseLip + 0.5],
-    [0, nose.baseLip + 0.5],
-  ]);
-  const hollow = cut(cut(solid, inner), bore);
-  return unify(hollow);
+  // The cavity starts 1 mm below the base so the cut leaves no sliver there;
+  // a tangent ogive is near-cylindrical at its base, so the inner radius at
+  // z = 0 is within a few micrometres of innerRadius.
+  const innerOgive = solidOgive(innerRadius, nose.length - nose.tipWall + 1);
+  const inner = transformed(innerOgive, translation(0, 0, -1));
+  const shell = cut(outer, inner);
+  const thread = threadRidge({
+    start: nose.threadStart,
+    pitch: nose.threadPitch,
+    turns: nose.threadTurns,
+    rootRadius: nose.threadRootRadius,
+    crestRadius: nose.threadCrestRadius,
+    halfWidth: nose.threadHalfWidth,
+  });
+  return unify(fuse(shell, thread));
 }
 
 function hollowCylinder(outer: number, inner: number, z0: number, z1: number): Shape {
@@ -265,23 +261,32 @@ function makeTube(): Shape {
   return hollowCylinder(body.outerRadius, body.outerRadius - body.wall, 0, tube.length);
 }
 
-// A helical thread ridge on a cylinder about Z: a triangular profile swept
-// along a helix with the binormal held along Z (so the profile keeps its
-// axial orientation, as a real thread does).
-function threadRidge(): Shape {
-  const frame = new oc.gp_Ax3(point(0, 0, can.threadStart), new oc.gp_Dir(0, 0, 1), new oc.gp_Dir(1, 0, 0));
-  const surface = new oc.Geom_CylindricalSurface(frame, can.threadRootRadius);
+interface Thread {
+  start: number; // z where the helix starts
+  pitch: number;
+  turns: number;
+  rootRadius: number; // where the ridge leaves the wall
+  crestRadius: number; // its tip: larger than rootRadius for a male thread, smaller for a female one
+  halfWidth: number; // half the axial width of the profile at its root
+}
+
+// A true helical thread ridge about Z: a triangular profile swept along a
+// helix with the binormal held along Z (so the profile keeps its axial
+// orientation, as a real thread does).
+function threadRidge(thread: Thread): Shape {
+  const frame = new oc.gp_Ax3(point(0, 0, thread.start), new oc.gp_Dir(0, 0, 1), new oc.gp_Dir(1, 0, 0));
+  const surface = new oc.Geom_CylindricalSurface(frame, thread.rootRadius);
   // On the unrolled cylinder (u = angle, v = height) a helix is a straight line.
-  const line = new oc.Geom2d_Line(new oc.gp_Pnt2d(0, 0), new oc.gp_Dir2d(2 * Math.PI, can.threadPitch));
-  const lengthOfOneTurn = Math.sqrt(4 * Math.PI * Math.PI + can.threadPitch * can.threadPitch);
-  const helixEdge = new oc.BRepBuilderAPI_MakeEdge(line, surface, 0, can.threadTurns * lengthOfOneTurn).Edge();
+  const line = new oc.Geom2d_Line(new oc.gp_Pnt2d(0, 0), new oc.gp_Dir2d(2 * Math.PI, thread.pitch));
+  const lengthOfOneTurn = Math.sqrt(4 * Math.PI * Math.PI + thread.pitch * thread.pitch);
+  const helixEdge = new oc.BRepBuilderAPI_MakeEdge(line, surface, 0, thread.turns * lengthOfOneTurn).Edge();
   oc.BRepLib.BuildCurves3d(helixEdge);
   const spine = new oc.BRepBuilderAPI_MakeWire(helixEdge).Wire();
-  // Profile in the XZ plane at the start of the helix (angle 0, x = root radius).
-  const z = can.threadStart;
-  const a: [number, number] = [can.threadRootRadius, z - can.threadHalfWidth];
-  const b: [number, number] = [can.threadCrestRadius, z];
-  const c: [number, number] = [can.threadRootRadius, z + can.threadHalfWidth];
+  // Profile in the XZ plane at the start of the helix (angle 0).
+  const z = thread.start;
+  const a: [number, number] = [thread.rootRadius, z - thread.halfWidth];
+  const b: [number, number] = [thread.crestRadius, z];
+  const c: [number, number] = [thread.rootRadius, z + thread.halfWidth];
   const profileMaker = new oc.BRepBuilderAPI_MakeWire();
   profileMaker.Add(lineEdgeXZ(a, b));
   profileMaker.Add(lineEdgeXZ(b, c));
@@ -314,7 +319,15 @@ function makeCan(): Shape {
     { kind: 'line', to: [can.innerRadius, top] },
     { kind: 'line', to: [can.innerRadius, 0] },
   ]);
-  let solid = fuse(shell, threadRidge());
+  const spigotThread = threadRidge({
+    start: can.threadStart,
+    pitch: can.threadPitch,
+    turns: can.threadTurns,
+    rootRadius: can.threadRootRadius,
+    crestRadius: can.threadCrestRadius,
+    halfWidth: can.threadHalfWidth,
+  });
+  let solid = fuse(shell, spigotThread);
 
   // The round window, and small radial holes near the bottom.
   const window = cylinderAlong([0, 0, can.windowHeight], [1, 0, 0], can.windowRadius, can.endRadius + 5);

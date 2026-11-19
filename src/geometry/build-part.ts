@@ -125,19 +125,13 @@ export function buildPart(raw: RawPart, fileName: string, solidIndex: number, so
   const hull = convexHull(hullPoints);
   const bvh = buildBvh(raw.positions, raw.indices);
 
-  const edgeCircles: Array<{ circle: { centre: Vec3; axis: Vec3; radius: number; span: number } | null }> = [];
-  for (let e = 0; e < raw.edges.length; e++) {
-    edgeCircles.push({ circle: raw.edges[e].circle });
-  }
   const candidates = attachFaces({
     positions: raw.positions,
     indices: raw.indices,
     triangleFace: raw.triangleFace,
     faces: raw.faces,
-    edges: edgeCircles,
     hullPoints: hullPoints,
     hullTriangles: hull.triangles,
-    bvh: bvh,
   });
 
   const boundsMin: Vec3 = [Infinity, Infinity, Infinity];

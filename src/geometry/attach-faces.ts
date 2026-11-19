@@ -1,58 +1,32 @@
 // Candidate attach faces of a part: where place on face and stack snapping
 // can join it to another part.
 //
-// Two sources, merged:
+// The candidates are the large flat sides of the part's convex hull, as
+// PrusaSlicer's and Bambu Studio's "lay on face" offer them, and nothing else.
+// So the open end of a nosecone is one big disc although the real surface
+// there is a thin ring, and a thread, a groove, a window or a small boss
+// offers nothing.
 //
-// 1. Flat sides of the convex hull, as PrusaSlicer's and Bambu Studio's "lay
-//    on face" offer them. Coplanar hull triangles are grouped into facets; a
-//    facet is kept when
-//      - its area is at least 1% of the hull's surface area (PrusaSlicer's
-//        GLGizmoFlatten uses 1% of the total area, as far as I recall it),
-//      - its outline has no corner sharper than 10 degrees (PrusaSlicer drops
-//        such slivers too), and
-//      - [our addition] a flat CAD face of the part really lies in the facet
-//        plane over at least 1% of the facet. Without this, the strips the
-//        hull makes along a tessellated cylinder or cone (each a few percent
-//        of the area on a long tube) would be offered. PrusaSlicer does offer
-//        them; for joining rocket sections they are noise.
-//
-// 2. Large circular flat features of the real geometry. On the can, internal
-//    structure sticks out of the open end, so the hull's end facet sits on
-//    the tip of the internals, not on the shell rim the user wants to mate.
-//    So every flat CAD face bounded by a circle of large radius also offers a
-//    disc (centre, normal, radius of that circle), when
-//      - the face's edges go at least 90% of the way round the circle,
-//      - the radius is at least 60% of the largest such circle on the part
-//        and at least 3 mm (small holes and bosses offer nothing),
-//      - the rim is on the outside: rays outward in the disc plane from just
-//        beyond the rim leave the part (a ledge inside a cavity fails), and
-//      - the face is open to the outside along its normal: from at least 25%
-//        of sample points on the face, a ray along the normal leaves the part
-//        without hitting it. A groove side wall faces the opposite wall and
-//        fails; the can rim faces past the internals and passes.
-//    Doubt: this would also offer an internal bulkhead that faces an open end
-//    (a disc deep inside a tube with nothing in front of it). On our parts
-//    such discs are hull facets anyway, so nothing extra appears; on a real
-//    part with a recessed bulkhead the user would see one more disc.
-//
-// Where a feature disc and a hull facet coincide (same plane, same centre)
-// they become one candidate. At most maxCandidates are kept, biggest first.
+// Coplanar hull triangles are grouped into facets. A facet is kept when
+//   - its area is at least 1% of the hull's surface area (PrusaSlicer's
+//     flatten gizmo drops planes below a fraction of the total area),
+//   - its outline has no corner sharper than 10 degrees (PrusaSlicer drops
+//     such slivers too), and
+//   - [our addition] the part really touches the facet plane with a flat
+//     face over at least 1% of the facet. Without this, the strips the hull
+//     makes along a tessellated cylinder or cone (each one or two percent of
+//     the area on a long tube) would be offered. PrusaSlicer does offer them;
+//     for joining rocket sections they are noise. This only removes hull
+//     facets; it never adds a face that is not one.
+// At most maxCandidates are kept, biggest first.
 
 import type { AttachFace, CadFace } from './part.ts';
 import type { Vec3 } from './vec3.ts';
 import { add, cross, dot, length, normalize, scale, sub, pointAt, anyPerpendicular } from './vec3.ts';
-import type { Bvh } from './part.ts';
-import { raycast } from './bvh.ts';
 
 export const minimumFacetAreaFraction = 0.01;
 export const sliverAngleDegrees = 10;
 export const minimumContactFraction = 0.01;
-export const featureRadiusFraction = 0.6;
-export const minimumFeatureRadius = 3;
-export const minimumClearFraction = 0.25;
-// A face's circular edges must go at least this far round (as a fraction of
-// a full turn) for the circle to count.
-export const minimumCircleCoverage = 0.9;
 export const maxCandidates = 12;
 
 // Hull triangles within this distance of a facet plane belong to it. The
@@ -68,10 +42,8 @@ export interface AttachInput {
   indices: Uint32Array;
   triangleFace: Uint32Array;
   faces: CadFace[];
-  edges: Array<{ circle: { centre: Vec3; axis: Vec3; radius: number; span: number } | null }>;
   hullPoints: Float64Array;
   hullTriangles: Uint32Array;
-  bvh: Bvh;
 }
 
 // A plane frame: origin, normal, and two in-plane axes.
@@ -201,7 +173,9 @@ function hasSliverCorner(outline: Array<[number, number]>): boolean {
 }
 
 // Least-squares circle through 2D points (Kasa fit). Returns null when the
-// points are not on a circle within 2% of its radius.
+// points are not on a circle within 2% of its radius. Only describes the
+// facet (its centre is then the circle centre, and the radius is reported);
+// it does not decide whether the facet is offered.
 function fitCircle(outline: Array<[number, number]>): { centre: [number, number]; radius: number } | null {
   if (outline.length < 12) {
     return null;
@@ -314,18 +288,8 @@ function longestDirection(frame: PlaneFrame, outline: Array<[number, number]>): 
   return normalize(world);
 }
 
-function circleOutline(frame: PlaneFrame, radius: number): Vec3[] {
-  const points: Vec3[] = [];
-  const segments = 64;
-  for (let i = 0; i < segments; i++) {
-    const angle = (2 * Math.PI * i) / segments;
-    points.push(fromPlane(frame, [radius * Math.cos(angle), radius * Math.sin(angle)]));
-  }
-  return points;
-}
-
 // Make a candidate from 2D outline points in a plane frame.
-function candidateFromOutline(frame: PlaneFrame, outline: Array<[number, number]>, source: AttachFace['source']): AttachFace {
+function candidateFromOutline(frame: PlaneFrame, outline: Array<[number, number]>): AttachFace {
   const circle = fitCircle(outline);
   const area = polygonArea(outline);
   let centre: Vec3;
@@ -347,7 +311,6 @@ function candidateFromOutline(frame: PlaneFrame, outline: Array<[number, number]
     area: area,
     radius: radius,
     longDirection: longestDirection(frame, outline),
-    source: source,
   };
 }
 
@@ -469,195 +432,13 @@ export function hullFacets(input: AttachInput): AttachFace[] {
     if (contact < minimumContactFraction * facetArea) {
       continue;
     }
-    facets.push(candidateFromOutline(frame, outline, 'hull'));
+    facets.push(candidateFromOutline(frame, outline));
   }
   return facets;
 }
 
-// Discs from flat CAD faces bounded by large circles (see the top of the file).
-export function featureDiscs(input: AttachInput): AttachFace[] {
-  interface Found {
-    face: number;
-    centre: Vec3;
-    normal: Vec3;
-    radius: number;
-  }
-  const found: Found[] = [];
-  let largest = 0;
-  for (let f = 0; f < input.faces.length; f++) {
-    const face = input.faces[f];
-    if (!face.flat || face.flatNormal === null) {
-      continue;
-    }
-    // Group the face's circular edges by circle (CAD often splits a circle
-    // into two or more arcs) and keep circles the face's edges go nearly all
-    // the way round. A fin's trailing edge face meeting the tube has an arc
-    // of the tube's radius, but only a few degrees of it.
-    const circles: Array<{ centre: Vec3; radius: number; span: number }> = [];
-    for (let k = 0; k < face.edges.length; k++) {
-      const circle = input.edges[face.edges[k]].circle;
-      if (circle === null) {
-        continue;
-      }
-      if (Math.abs(dot(circle.axis, face.flatNormal)) < 0.999) {
-        continue;
-      }
-      let joined = false;
-      for (let c = 0; c < circles.length; c++) {
-        const sameCentre = length(sub(circles[c].centre, circle.centre)) < 1e-3;
-        const sameRadius = Math.abs(circles[c].radius - circle.radius) < 1e-3;
-        if (sameCentre && sameRadius) {
-          circles[c].span = circles[c].span + circle.span;
-          joined = true;
-        }
-      }
-      if (!joined) {
-        circles.push({ centre: circle.centre, radius: circle.radius, span: circle.span });
-      }
-    }
-    let best: Found | null = null;
-    for (let c = 0; c < circles.length; c++) {
-      if (circles[c].span < minimumCircleCoverage * 2 * Math.PI) {
-        continue;
-      }
-      if (best === null || circles[c].radius > best.radius) {
-        best = { face: f, centre: circles[c].centre, normal: face.flatNormal, radius: circles[c].radius };
-      }
-    }
-    if (best !== null) {
-      found.push(best);
-      largest = Math.max(largest, best.radius);
-    }
-  }
-
-  const discs: AttachFace[] = [];
-  for (let i = 0; i < found.length; i++) {
-    const candidate = found[i];
-    if (candidate.radius < minimumFeatureRadius || candidate.radius < featureRadiusFraction * largest) {
-      continue;
-    }
-    if (clearFraction(input, candidate.face, candidate.normal) < minimumClearFraction) {
-      continue;
-    }
-    if (!rimIsOutside(input, candidate.centre, candidate.normal, candidate.radius)) {
-      continue;
-    }
-    const frame = planeFrame(candidate.centre, candidate.normal);
-    discs.push({
-      normal: candidate.normal,
-      centre: candidate.centre,
-      outline: circleOutline(frame, candidate.radius),
-      area: Math.PI * candidate.radius * candidate.radius,
-      radius: candidate.radius,
-      longDirection: frame.u,
-      source: 'feature',
-    });
-  }
-  return discs;
-}
-
-// Fraction of sample points on a face from which a ray along the normal
-// leaves the part without hitting it. Samples: triangle centres and the
-// midpoints of triangle edges.
-function clearFraction(input: AttachInput, faceIndex: number, normal: Vec3): number {
-  let samples = 0;
-  let clear = 0;
-  const triangleCount = input.indices.length / 3;
-  for (let t = 0; t < triangleCount; t++) {
-    if (input.triangleFace[t] !== faceIndex) {
-      continue;
-    }
-    const a = pointAt(input.positions, input.indices[3 * t]);
-    const b = pointAt(input.positions, input.indices[3 * t + 1]);
-    const c = pointAt(input.positions, input.indices[3 * t + 2]);
-    const starts: Vec3[] = [
-      scale(add(add(a, b), c), 1 / 3),
-      scale(add(a, b), 0.5),
-      scale(add(b, c), 0.5),
-      scale(add(c, a), 0.5),
-    ];
-    for (let k = 0; k < starts.length; k++) {
-      // Start a little off the face so the face itself is not hit.
-      const origin = add(starts[k], scale(normal, 0.01));
-      const hit = raycast(input.bvh, input.positions, input.indices, origin, normal, Infinity);
-      samples = samples + 1;
-      if (hit === null) {
-        clear = clear + 1;
-      }
-    }
-  }
-  if (samples === 0) {
-    return 0;
-  }
-  return clear / samples;
-}
-
-// Is the disc's rim on the outside of the part? From just beyond the rim
-// (and just in front of the face), rays straight outward in the disc plane
-// must mostly leave the part. A ledge inside a cavity (the top of a nose's
-// bore, the top of a strut inside the can) has wall all round it and fails.
-function rimIsOutside(input: AttachInput, centre: Vec3, normal: Vec3, radius: number): boolean {
-  const frame = planeFrame(centre, normal);
-  const rays = 16;
-  let clear = 0;
-  for (let i = 0; i < rays; i++) {
-    const angle = (2 * Math.PI * i) / rays;
-    const outward = normalize(add(scale(frame.u, Math.cos(angle)), scale(frame.v, Math.sin(angle))));
-    const origin = add(add(centre, scale(outward, radius + 0.05)), scale(normal, 0.05));
-    const hit = raycast(input.bvh, input.positions, input.indices, origin, outward, Infinity);
-    if (hit === null) {
-      clear = clear + 1;
-    }
-  }
-  return clear >= rays / 2;
-}
-
-// Two candidates are the same place when their planes and centres coincide.
-function sameCandidate(a: AttachFace, b: AttachFace): boolean {
-  if (dot(a.normal, b.normal) < 0.999) {
-    return false;
-  }
-  const planeGap = Math.abs(dot(sub(b.centre, a.centre), a.normal));
-  if (planeGap > 0.05) {
-    return false;
-  }
-  const centreGap = length(sub(b.centre, a.centre));
-  let size = Math.sqrt(Math.max(a.area, b.area));
-  if (a.radius !== null) {
-    size = a.radius;
-  }
-  return centreGap < Math.max(0.5, 0.05 * size);
-}
-
 export function attachFaces(input: AttachInput): AttachFace[] {
-  const facets = hullFacets(input);
-  const discs = featureDiscs(input);
-  const result: AttachFace[] = facets.slice();
-  for (let i = 0; i < discs.length; i++) {
-    const disc = discs[i];
-    let merged = false;
-    for (let k = 0; k < result.length; k++) {
-      if (sameCandidate(result[k], disc)) {
-        // Keep the exact circle of the feature; it is where parts join.
-        if (result[k].source === 'hull') {
-          result[k] = {
-            normal: result[k].normal,
-            centre: disc.centre,
-            outline: disc.outline,
-            area: disc.area,
-            radius: disc.radius,
-            longDirection: result[k].longDirection,
-            source: 'both',
-          };
-        }
-        merged = true;
-        break;
-      }
-    }
-    if (!merged) {
-      result.push(disc);
-    }
-  }
+  const result = hullFacets(input);
   result.sort(function byArea(p, q) {
     return q.area - p.area;
   });

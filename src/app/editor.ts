@@ -391,7 +391,6 @@ export class Editor {
       area: face.area,
       radius: face.radius,
       longDirection: applyToDirection(placed.transform, face.longDirection),
-      source: face.source,
     };
   }
 

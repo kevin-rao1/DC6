@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { loadModel, loadPart } from './models.ts';
-import { body, nose, can, fin, boattail } from '../tools/test-model-dimensions.ts';
+import { body, can, fin, boattail } from '../tools/test-model-dimensions.ts';
 import { dot, length, sub } from '../src/geometry/vec3.ts';
 import { convexHull } from '../src/geometry/hull.ts';
 import type { AttachFace } from '../src/geometry/part.ts';
@@ -36,19 +36,17 @@ describe('convex hull', () => {
 });
 
 describe('attach faces', () => {
-  it('offers the nosecone aft end as one disc of the shoulder radius, and the shoulder step', async () => {
+  it('offers the open end of the hollow nose as one disc of the full radius, and nothing else', async () => {
     const part = await loadPart('nose');
-    const shoulderEnd = discsOfRadius(part.attachFaces, nose.shoulderOuterRadius);
-    expect(shoulderEnd.length).toBe(1);
-    const step = discsOfRadius(part.attachFaces, body.outerRadius);
-    expect(step.length).toBe(1);
-    // Both face aft (the nose file points along -Y, so aft is +Y).
-    expect(shoulderEnd[0].normal[1]).toBeCloseTo(1, 6);
-    expect(step[0].normal[1]).toBeCloseTo(1, 6);
-    // The shoulder end is 30 mm aft of the step.
-    const gap = dot(sub(shoulderEnd[0].centre, step[0].centre), shoulderEnd[0].normal);
-    expect(gap).toBeCloseTo(nose.shoulderLength, 3);
-    expect(part.attachFaces.length).toBe(2);
+    // The real surface at the base is a 1.3 mm ring and there is a thread
+    // inside; the hull offers one disc across the whole opening.
+    expect(part.attachFaces.length).toBe(1);
+    const base = part.attachFaces[0];
+    expect(base.radius).not.toBeNull();
+    expect(base.radius!).toBeCloseTo(body.outerRadius, 2);
+    // The nose file points along -Y, so its base faces +Y.
+    expect(base.normal[1]).toBeCloseTo(1, 6);
+    expect(part.guessedAttachFace).toBe(0);
   });
 
   it('offers both tube ends as discs, and nothing along the side', async () => {
@@ -70,31 +68,21 @@ describe('attach faces', () => {
     // To 1e-4 rad: the outline comes from float32 mesh vertices.
     expect(Math.abs(dot(guess.longDirection, side.normal))).toBeLessThan(1e-4);
     expect(Math.abs(dot(guess.normal, side.normal))).toBeLessThan(1e-6);
+    // The rounded leading edge, trailing edge and tip offer nothing.
+    expect(part.attachFaces.length).toBe(3);
   });
 
-  it('offers the can rim even though the internals stick out past it', async () => {
+  it('offers the can spigot end and the tip of its internals, and nothing for the thread, window or holes', async () => {
     const part = await loadPart('can');
-    const big = discsOfRadius(part.attachFaces, can.endRadius);
-    // Rim (open end) and the shoulder step at the spigot end, facing opposite ways.
-    expect(big.length).toBe(2);
-    expect(dot(big[0].normal, big[1].normal)).toBeCloseTo(-1, 6);
-    // The rim is the one the internals pass through: the hull's end facet on
-    // the internals' tip lies 70 mm beyond it, along its normal.
+    expect(part.attachFaces.length).toBe(2);
+    const spigotEnd = discsOfRadius(part.attachFaces, can.spigotCoreRadius);
     const tip = discsOfRadius(part.attachFaces, can.ringOuterRadius);
+    expect(spigotEnd.length).toBe(1);
     expect(tip.length).toBe(1);
-    const rim = big.find((f) => dot(f.normal, tip[0].normal) > 0.99)!;
-    const beyond = dot(sub(tip[0].centre, rim.centre), rim.normal);
-    expect(beyond).toBeCloseTo(-can.ringBottom, 3);
-  });
-
-  it('offers nothing for the can thread, window or small holes, and few candidates in all', async () => {
-    const part = await loadPart('can');
-    expect(part.attachFaces.length).toBeLessThanOrEqual(6);
-    for (const face of part.attachFaces) {
-      // Every candidate is a disc of a large radius, perpendicular to the axis.
-      expect(face.radius).not.toBeNull();
-      expect(face.radius!).toBeGreaterThanOrEqual(can.ringOuterRadius - 0.01);
-    }
+    expect(dot(spigotEnd[0].normal, tip[0].normal)).toBeCloseTo(-1, 6);
+    // The two are the spigot top and the ring at the bottom of the internals.
+    const apart = dot(sub(spigotEnd[0].centre, tip[0].centre), spigotEnd[0].normal);
+    expect(apart).toBeCloseTo(can.shellHeight + can.spigotLength - can.ringBottom, 3);
     expect(discsOfRadius(part.attachFaces, can.windowRadius).length).toBe(0);
   });
 
@@ -104,7 +92,7 @@ describe('attach faces', () => {
       const parts = await loadModel(name);
       for (const part of parts) {
         expect(part.attachFaces.length).toBeGreaterThan(0);
-        expect(part.attachFaces.length).toBeLessThan(12);
+        expect(part.attachFaces.length).toBeLessThanOrEqual(3);
         // Biggest first.
         for (let i = 1; i < part.attachFaces.length; i++) {
           expect(part.attachFaces[i].area).toBeLessThanOrEqual(part.attachFaces[i - 1].area);

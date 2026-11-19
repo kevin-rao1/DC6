@@ -53,15 +53,14 @@ export interface CadEdge {
   circle: { centre: Vec3; axis: Vec3; radius: number; span: number } | null;
 }
 
-// A place where this part can be joined to another: a flat side of its convex
-// hull, or a large circular flat feature of the real geometry (see
-// attach-faces.ts). Shown as a translucent patch by place on face and used as
+// A place where this part can be joined to another: a large flat side of its
+// convex hull (see attach-faces.ts). Shown as a translucent patch by place on face and used as
 // an attach node by stack snapping.
 export interface AttachFace {
   // Outward unit normal (pointing away from the part).
   normal: Vec3;
   // Where two joined faces are made to coincide: the circle centre when the
-  // face is circular, else the centroid of the outline.
+  // outline is a circle, else the centroid of the outline.
   centre: Vec3;
   // Convex outline in the face plane, as points in order.
   outline: Vec3[];
@@ -72,9 +71,6 @@ export interface AttachFace {
   // The direction in the face plane along which the outline is longest
   // (unit). Used to line a fin root up with the rocket axis.
   longDirection: Vec3;
-  // 'hull' = a facet of the convex hull, 'feature' = from a circular flat face
-  // of the real geometry, 'both' = the two coincide.
-  source: 'hull' | 'feature' | 'both';
 }
 
 // Bounding volume hierarchy over the part's triangles, for ray casts.

@@ -1,9 +1,9 @@
 // Every dimension of the generated test models, in millimetres, in one place.
 //
 // The parts are sized to assemble into one rocket of 66 mm diameter:
-//   nose cone (shoulder goes into the tube) - body tube - can (threaded spigot
-//   goes up into the tube, internals hang down into the boattail) - boattail,
-//   with four fins on the tube, canards optional, a sled inside.
+//   nose cone - can (its threaded spigot screws 12 mm up into the nose, its
+//   internals hang 70 mm out of its open end into the tube) - body tube -
+//   boattail, with four fins on the tube, canards optional, a sled inside.
 //
 // Each part is modelled in its own local frame: axis along +Z, aft end at
 // z = 0 unless noted. `placements` then moves each file somewhere arbitrary,
@@ -14,14 +14,20 @@ export const body = {
   wall: 1.5, // inner radius 31.5
 };
 
+// Modelled on the team's own threaded nose: a hollow tangent ogive with a
+// plain open base rim and a female thread inside its first 12 mm. The can's
+// male spigot screws 12 mm up into it, so the nose rim lands on the can's
+// shoulder.
 export const nose = {
-  length: 170, // ogive, base to tip
-  wall: 1.6,
-  innerLength: 165, // the inner ogive stops short of the tip
-  baseLip: 3, // solid ring at the base joining the ogive shell to the shoulder
-  shoulderOuterRadius: 31.4, // slides into the tube (inner radius 31.5)
-  shoulderInnerRadius: 29.9,
-  shoulderLength: 30,
+  length: 116.5, // ogive, base to tip
+  wall: 1.3, // inner radius 31.7 at the base
+  tipWall: 4, // the inner ogive is this much shorter, so the tip is closed
+  threadStart: 1, // z where the female helix starts, above the base rim
+  threadPitch: 2,
+  threadTurns: 5, // 1 + 5 x 2 + half width stays inside the first 12 mm
+  threadRootRadius: 31.9, // the profile starts a little inside the wall so the fuse overlaps
+  threadCrestRadius: 30.4, // clear of the can's spigot core (30)
+  threadHalfWidth: 0.8,
 };
 
 export const tube = {
