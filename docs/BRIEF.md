@@ -19,7 +19,8 @@ In version 2 the user builds the rocket in DC6, the way a rocket is built in the
    * end to end, centred on the same axis (a nosecone onto a tube), or
    * onto the side of a part, standing out from the surface (a fin onto a tube).
    Click to drop it. The first part dropped is the root; the rocket stands nose up.
-4. To fix a part that did not snap the way you wanted, use **place on face**, as in Bambu Studio: click a face on the part, then a face on the rocket, and the two faces are brought together. Round faces are centred on each other. This is also the quick way to join sections.
+4. To fix a part that did not snap the way you wanted, use **place on face**, as in Bambu Studio: click a face on the part, then a face on the rocket, and the two are brought together, centred. This is also the quick way to join sections.
+   The faces offered are not the CAD faces. They are the flat sides of the part's outer wrapping (its convex hull), largest first, as Bambu does it. So the open end of a nosecone is offered as one big disc although the real surface there is a thin ring, and a screw thread, a groove or a small boss offers nothing to get caught on. A handful of big faces per part, each one a place you would plausibly want to join.
 5. A dropped part can be picked up again (its children come with it), nudged with a move gizmo, turned with a rotate gizmo, with angle snap on by default.
 6. Symmetry works on parts as it does on decals: set ×4 and one fin becomes four, linked, around the axis.
 7. A part can be hidden (internals, a sled). Hidden parts take no decals and are not exported.
