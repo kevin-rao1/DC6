@@ -1,12 +1,11 @@
-// The panels around the 3D view: toolbar, parts list, rocket tree,
-// inspector, empty state. Plain DOM; everything they do goes through the
+// The panels around the 3D view: toolbar, parts list, rocket tree, the
+// adjust-last-operation panel, empty state. Plain DOM; everything they do goes through the
 // editor.
 
-import * as THREE from 'three';
-import type { Editor, Tool } from './editor.ts';
+import type { Editor, LastOperation, Tool } from './editor.ts';
 import type { PresetView } from './view.ts';
 import type { AssemblyDocument, PlacedPart } from '../model/document.ts';
-import { findPlaced, requirePlaced, symmetryMembers } from '../model/document.ts';
+import { symmetryMembers } from '../model/document.ts';
 import { renderThumbnail } from './thumbnails.ts';
 
 // Stroke icons, 20 x 20 view box.
@@ -49,7 +48,7 @@ export class Ui {
   private readonly bin: HTMLElement;
   private readonly binList: HTMLElement;
   private readonly tree: HTMLElement;
-  private readonly inspector: HTMLElement;
+  private readonly adjust: HTMLElement;
   private readonly empty: HTMLElement;
   private readonly toast: HTMLElement;
   private readonly fileInput: HTMLInputElement;
@@ -59,10 +58,8 @@ export class Ui {
   private readonly redoButton: HTMLButtonElement;
   private readonly thumbnails = new Map<string, string>();
   private readonly pending: PendingFile[] = [];
-  private inspectorFor: string | null = null;
-  private readonly inputs: HTMLInputElement[] = [];
-  // The text last written into each input, to tell which ones the user changed.
-  private readonly shownTexts: string[] = [];
+  private adjustFor: LastOperation | null = null;
+  private readonly adjustInputs: HTMLInputElement[] = [];
   private toastTimer = 0;
   private refreshQueued = false;
 
@@ -166,7 +163,7 @@ export class Ui {
     this.binList = element('div', 'bin-list', this.bin);
 
     this.tree = element('div', 'tree', root);
-    this.inspector = element('div', 'inspector', root);
+    this.adjust = element('div', 'adjust', root);
     this.toast = element('div', 'toast', root);
 
     // Drag and drop anywhere in the window.
@@ -261,7 +258,7 @@ export class Ui {
 
     this.refreshBin();
     this.refreshTree();
-    this.refreshInspector();
+    this.refreshAdjust();
   }
 
   private refreshBin(): void {
@@ -328,7 +325,15 @@ export class Ui {
         text = text + ' ×' + String(placed.symmetry.count);
       }
       name.textContent = text;
-      const eye = element('button', 'eye', row);
+      const remove = element('button', 'row-button remove', row);
+      remove.innerHTML = icon('trash');
+      remove.title = 'Delete (Del)';
+      remove.addEventListener('click', function deletePart(event) {
+        event.stopPropagation();
+        editor.select(placed.id);
+        editor.deleteSelected();
+      });
+      const eye = element('button', 'row-button eye', row);
       eye.innerHTML = icon(placed.hidden ? 'eyeOff' : 'eye');
       eye.title = placed.hidden ? 'Show' : 'Hide';
       eye.addEventListener('click', function toggle(event) {
@@ -341,158 +346,113 @@ export class Ui {
     }
   }
 
-  private refreshInspector(): void {
-    const editor = this.editor;
-    const selectedId = editor.selectedId;
-    const shown = editor.shownDocument;
-    if (selectedId === null || editor.isHolding()) {
-      this.inspector.style.display = 'none';
-      this.inspectorFor = null;
+  // Blender's "Adjust Last Operation": after a move or rotate with a gizmo,
+  // a small panel shows what that operation did, in the rocket's terms.
+  // Typing a value re-does the operation with exactly that value.
+  private refreshAdjust(): void {
+    const operation = this.editor.lastOperation;
+    if (operation === null) {
+      this.adjust.style.display = 'none';
+      this.adjustFor = null;
       return;
     }
-    const placed = findPlaced(shown, selectedId);
-    if (placed === null) {
-      this.inspector.style.display = 'none';
-      return;
+    this.adjust.style.display = '';
+    if (this.adjustFor !== operation) {
+      this.buildAdjust(operation);
+      this.adjustFor = operation;
     }
-    this.inspector.style.display = '';
-    if (this.inspectorFor !== selectedId) {
-      this.buildInspector(placed);
-      this.inspectorFor = selectedId;
-    }
-    this.fillInspector(false);
-  }
-
-  // Fill in the numbers; a field the user is typing in is left alone unless
-  // `force` is set.
-  private fillInspector(force: boolean): void {
-    const editor = this.editor;
-    const pivot = editor.selectedPivot();
-    if (pivot === null || editor.selectedId === null) {
-      return;
-    }
-    const placed = requirePlaced(editor.shownDocument, editor.selectedId);
-    const values = placementToFields(pivot, placed);
-    for (let i = 0; i < this.inputs.length; i++) {
-      if (force || document.activeElement !== this.inputs[i]) {
-        const text = values[i].toFixed(i < 3 ? 2 : 1);
-        this.inputs[i].value = text;
-        this.shownTexts[i] = text;
+    const values = operationValues(operation);
+    for (let i = 0; i < this.adjustInputs.length; i++) {
+      if (document.activeElement !== this.adjustInputs[i]) {
+        this.adjustInputs[i].value = values[i].toFixed(1);
       }
     }
   }
 
-  private buildInspector(placed: PlacedPart): void {
-    const editor = this.editor;
+  private buildAdjust(operation: LastOperation): void {
     const self = this;
-    this.inspector.textContent = '';
-    this.inputs.length = 0;
-    const header = element('div', 'inspector-header', this.inspector);
-    const title = element('span', 'inspector-title', header);
-    const part = editor.parts.get(placed.partId);
-    title.textContent = part === undefined ? placed.partId : part.name;
-    const remove = element('button', 'icon-button', header);
-    remove.innerHTML = icon('trash');
-    remove.title = 'Delete (Del)';
-    remove.addEventListener('click', function deletePart() {
-      editor.deleteSelected();
-    });
-    const rows: Array<[string, string]> = [
-      ['Position', 'mm'],
-      ['Rotation', '°'],
-    ];
+    this.adjust.textContent = '';
+    this.adjustInputs.length = 0;
+    const title = element('div', 'adjust-title', this.adjust);
+    let rows: Array<[string, string]>;
+    if (operation.kind === 'move') {
+      title.textContent = 'Move';
+      rows = [
+        ['Along', 'mm'],
+        ['Up', 'mm'],
+        ['Side', 'mm'],
+      ];
+    } else {
+      title.textContent = 'Rotate about ' + axisName(operation.axis);
+      rows = [['Angle', '°']];
+    }
     for (let r = 0; r < rows.length; r++) {
-      const row = element('div', 'inspector-row', this.inspector);
-      const label = element('span', 'inspector-label', row);
+      const row = element('label', 'adjust-row', this.adjust);
+      const label = element('span', 'adjust-label', row);
       label.textContent = rows[r][0];
-      const axes = ['X', 'Y', 'Z'];
-      for (let a = 0; a < 3; a++) {
-        const field = element('label', 'field', row);
-        const axis = element('span', 'axis', field);
-        axis.textContent = axes[a];
-        const input = element('input', '', field);
-        input.type = 'text';
-        input.inputMode = 'decimal';
-        input.spellcheck = false;
-        input.addEventListener('change', function apply() {
-          self.applyInspector();
-        });
-        input.addEventListener('keydown', function enter(event) {
-          if (event.key === 'Enter') {
-            input.blur();
-          }
-        });
-        this.inputs.push(input);
-      }
+      const input = element('input', '', row);
+      input.type = 'text';
+      input.inputMode = 'decimal';
+      input.spellcheck = false;
+      input.dataset.field = rows[r][0].toLowerCase();
+      input.addEventListener('focus', function selectAll() {
+        input.select();
+      });
+      input.addEventListener('change', function apply() {
+        self.applyAdjust();
+      });
+      input.addEventListener('keydown', function keys(event) {
+        if (event.key === 'Enter') {
+          input.blur();
+        } else if (event.key === 'Escape') {
+          self.adjustFor = null;
+          input.blur();
+          self.refresh();
+        }
+      });
       const unit = element('span', 'unit', row);
       unit.textContent = rows[r][1];
+      this.adjustInputs.push(input);
     }
   }
 
-  // Apply what the user typed. Only fields the user changed are read: the
-  // others keep their exact values, so typing a position does not round the
-  // rotation to the one decimal shown (that would tip a part off the axis).
-  private applyInspector(): void {
-    const editor = this.editor;
-    const pivot = editor.selectedPivot();
-    if (pivot === null || editor.selectedId === null) {
+  private applyAdjust(): void {
+    const operation = this.editor.lastOperation;
+    if (operation === null) {
       return;
     }
-    const placed = requirePlaced(editor.shownDocument, editor.selectedId);
-    const values = placementToFields(pivot, placed);
-    let rotationChanged = false;
-    for (let i = 0; i < this.inputs.length; i++) {
-      if (this.inputs[i].value === this.shownTexts[i]) {
-        continue;
-      }
-      const value = evaluateSum(this.inputs[i].value);
-      if (value === null) {
-        // Not a number: put the real values back.
-        this.fillInspector(true);
-        return;
-      }
-      values[i] = value;
-      if (i >= 3) {
-        rotationChanged = true;
+    const current = operationValues(operation);
+    const values: number[] = [];
+    for (let i = 0; i < this.adjustInputs.length; i++) {
+      const text = this.adjustInputs[i].value.replace(',', '.').replace('\u2212', '-').trim();
+      const value = Number(text);
+      if (text === '' || !Number.isFinite(value)) {
+        // Not a number: keep what the operation did.
+        values.push(current[i]);
+        this.adjustInputs[i].value = current[i].toFixed(1);
+      } else {
+        values.push(value);
       }
     }
-    let rotation = placed.transform.rotation;
-    if (rotationChanged) {
-      const euler = new THREE.Euler((values[3] * Math.PI) / 180, (values[4] * Math.PI) / 180, (values[5] * Math.PI) / 180, 'XYZ');
-      const quaternion = new THREE.Quaternion().setFromEuler(euler);
-      rotation = [quaternion.x, quaternion.y, quaternion.z, quaternion.w];
-    }
-    editor.setSelectedPlacement([values[0], values[1], values[2]], rotation);
+    this.editor.adjustLastOperation(values);
   }
 }
 
-// The inspector shows where the middle of the part is (the point the gizmos
-// sit on) and the part's rotation as X, Y, Z angles.
-function placementToFields(pivot: [number, number, number], placed: PlacedPart): number[] {
-  const q = placed.transform.rotation;
-  const euler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(q[0], q[1], q[2], q[3]), 'XYZ');
-  const degrees = 180 / Math.PI;
-  return [pivot[0], pivot[1], pivot[2], euler.x * degrees, euler.y * degrees, euler.z * degrees];
+function operationValues(operation: LastOperation): number[] {
+  if (operation.kind === 'move') {
+    return [operation.along, operation.up, operation.side];
+  }
+  return [operation.degrees];
 }
 
-// A field may hold a number or a sum such as "-130+12", so a part can be
-// pushed 12 mm by typing "+12" after the value that is there.
-export function evaluateSum(text: string): number | null {
-  const cleaned = text.replace(/\s+/g, '').replace(/,/g, '.').replace(/\u2212/g, '-');
-  const wholePattern = /^[+-]?(\d+\.?\d*|\.\d+)([+-](\d+\.?\d*|\.\d+))*$/;
-  if (!wholePattern.test(cleaned)) {
-    return null;
+function axisName(axis: 'along' | 'up' | 'side'): string {
+  if (axis === 'along') {
+    return 'the axis';
   }
-  const termPattern = /[+-]?(\d+\.?\d*|\.\d+)/g;
-  const terms = cleaned.match(termPattern);
-  if (terms === null) {
-    return null;
+  if (axis === 'up') {
+    return 'up';
   }
-  let total = 0;
-  for (let i = 0; i < terms.length; i++) {
-    total = total + Number(terms[i]);
-  }
-  return total;
+  return 'side';
 }
 
 function hasFiles(event: DragEvent): boolean {

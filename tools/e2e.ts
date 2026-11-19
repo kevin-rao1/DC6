@@ -176,8 +176,41 @@ async function bringHeldNodeTo(page: Page, ownRadius: number, target: Vec3): Pro
     if ((await heldSnap(page)) === 'stack') {
       return;
     }
-    await glide(page, mouseAt.x + dx, mouseAt.y + dy, 15);
+    await glide(page, mouseAt.x + dx, mouseAt.y + dy, 8);
   }
+}
+
+// Drag the move gizmo's axis handle by about `millimetres` towards the tail
+// (screen right in the side view). Returns the label shown during the drag.
+async function dragAxisHandle(page: Page, millimetres: number): Promise<string | null> {
+  const pivot = await page.evaluate(function read() {
+    return window.dc6.gizmoPivot();
+  });
+  const pivotScreen = await screenOf(page, pivot);
+  // Find the handle: slide right from the pivot until it lights up.
+  let handle: { x: number; y: number } | null = null;
+  for (let d = 16; d < 240; d = d + 4) {
+    await glide(page, pivotScreen.x + d, pivotScreen.y, 1);
+    const hovered = await page.evaluate(function read() {
+      return window.dc6.gizmoHovered();
+    });
+    if (hovered) {
+      handle = { x: pivotScreen.x + d, y: pivotScreen.y };
+      break;
+    }
+  }
+  if (handle === null) {
+    throw new Error('could not find the move handle');
+  }
+  const mmPerPixel = await page.evaluate(function read(p: Vec3) {
+    return window.dc6.millimetresPerPixel(p);
+  }, pivot);
+  await page.mouse.down();
+  await glide(page, handle.x + millimetres / mmPerPixel, handle.y, 8);
+  const label = await page.locator('.gizmo-label').textContent();
+  await page.mouse.up();
+  await page.waitForTimeout(100);
+  return label;
 }
 
 async function main(): Promise<void> {
@@ -253,12 +286,12 @@ async function main(): Promise<void> {
     await fitView(page);
     await shot(page, 'tube-turned');
 
-    console.log('4. snap the can onto the tube by its internals, then push it 70 mm aft by typing');
+    console.log('4. snap the can onto the tube by its internals, then drag it 70 mm aft with the move gizmo');
     await clickSelector(page, '.bin-item[data-part-name="can"]');
-    await glide(page, emptySpot.x, emptySpot.y, 15);
+    await glide(page, emptySpot.x, emptySpot.y, 6);
     const tubeFore = faceFacing(tubeFaces, body.outerRadius, -1);
     const tubeForePoint = await screenOf(page, tubeFore.centre);
-    await glide(page, tubeForePoint.x - 120, emptySpot.y, 15);
+    await glide(page, tubeForePoint.x - 120, emptySpot.y, 6);
     await bringHeldNodeTo(page, can.ringOuterRadius, tubeFore.centre);
     check((await heldSnap(page)) === 'stack', 'the held can snaps onto the tube end');
     await shot(page, 'can-snapped');
@@ -269,16 +302,8 @@ async function main(): Promise<void> {
     const canPlaced = one(doc, names, 'can');
     check(canPlaced.parentId === tube.id, 'the can is a child of the tube');
     await clickSelector(page, 'button[data-tool="move"]');
-    const xField = page.locator('.inspector input').first();
-    const xBox = await xField.boundingBox();
-    if (xBox === null) {
-      throw new Error('no inspector');
-    }
-    await click(page, xBox.x + xBox.width - 4, xBox.y + xBox.height / 2);
-    await page.keyboard.press('End');
-    await page.keyboard.type('+70', { delay: 30 });
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(100);
+    const canLabel = await dragAxisHandle(page, 70);
+    check(canLabel === '+70 mm', 'dragging the can shows +70 mm (' + String(canLabel) + ')');
     let canFaces = await faces(page, canPlaced.id);
     const canTip = faceOfRadius(canFaces, can.ringOuterRadius);
     check(Math.abs(canTip.centre[0] - (tubeFore.centre[0] + 70)) < 1e-6, 'the can moved 70 mm aft: its internals are inside the tube');
@@ -289,12 +314,12 @@ async function main(): Promise<void> {
     await fitView(page);
     await shot(page, 'can-pushed-in');
 
-    console.log('5. snap the nose onto the can spigot, then drag it 12 mm aft with the move gizmo');
+    console.log('5. snap the nose onto the can spigot, drag it roughly aft, then type 12 into the adjust panel');
     await clickSelector(page, 'button[data-tool="place"]');
     await clickSelector(page, '.bin-item[data-part-name="nose"]');
-    await glide(page, emptySpot.x, emptySpot.y, 15);
+    await glide(page, emptySpot.x, emptySpot.y, 6);
     const spigotPoint = await screenOf(page, spigotEnd.centre);
-    await glide(page, spigotPoint.x - 150, emptySpot.y, 15);
+    await glide(page, spigotPoint.x - 150, emptySpot.y, 6);
     await bringHeldNodeTo(page, body.outerRadius, spigotEnd.centre);
     check((await heldSnap(page)) === 'stack', 'the held nose snaps onto the can spigot');
     await shot(page, 'nose-snapped');
@@ -305,35 +330,19 @@ async function main(): Promise<void> {
     const nosePlaced = one(doc, names, 'nose');
     check(nosePlaced.parentId === canPlaced.id, 'the nose is a child of the can');
     await clickSelector(page, 'button[data-tool="move"]');
-    const pivot = await page.evaluate(function read() {
-      return window.dc6.gizmoPivot();
-    });
-    const pivotScreen = await screenOf(page, pivot);
-    // Find the axis handle: slide right from the pivot until it lights up.
-    let handle: { x: number; y: number } | null = null;
-    for (let d = 16; d < 240; d = d + 4) {
-      await glide(page, pivotScreen.x + d, pivotScreen.y, 1);
-      const hovered = await page.evaluate(function read() {
-        return window.dc6.gizmoHovered();
-      });
-      if (hovered) {
-        handle = { x: pivotScreen.x + d, y: pivotScreen.y };
-        break;
-      }
+    const roughLabel = await dragAxisHandle(page, 9);
+    await shot(page, 'nose-dragged-roughly');
+    check(roughLabel !== null && roughLabel !== '+12 mm', 'the rough drag is not already 12 mm (' + String(roughLabel) + ')');
+    const alongField = page.locator('.adjust input[data-field="along"]');
+    const alongBox = await alongField.boundingBox();
+    if (alongBox === null) {
+      throw new Error('no adjust panel after the move');
     }
-    if (handle === null) {
-      throw new Error('could not find the move handle');
-    }
-    const mmPerPixel = await page.evaluate(function read(p: Vec3) {
-      return window.dc6.millimetresPerPixel(p);
-    }, pivot);
-    await page.mouse.down();
-    await glide(page, handle.x + 12 / mmPerPixel, handle.y, 25);
-    const label = await page.locator('.gizmo-label').textContent();
-    check(label === '+12 mm', 'the drag label reads +12 mm (' + String(label) + ')');
-    await shot(page, 'nose-dragging');
-    await page.mouse.up();
+    await click(page, alongBox.x + alongBox.width / 2, alongBox.y + alongBox.height / 2);
+    await page.keyboard.type('12', { delay: 30 });
+    await page.keyboard.press('Enter');
     await page.waitForTimeout(100);
+    await shot(page, 'nose-adjusted');
     const noseFaces = await faces(page, nosePlaced.id);
     const noseBase = faceOfRadius(noseFaces, body.outerRadius);
     canFaces = await faces(page, canPlaced.id);
@@ -346,11 +355,16 @@ async function main(): Promise<void> {
     console.log('6. snap the boattail onto the tube');
     await clickSelector(page, 'button[data-tool="place"]');
     await clickSelector(page, '.bin-item[data-part-name="boattail"]');
-    await glide(page, emptySpot.x, emptySpot.y, 15);
+    const adjustGone = await page.evaluate(function hidden() {
+      const panel = document.querySelector('.adjust') as HTMLElement | null;
+      return panel === null || panel.style.display === 'none';
+    });
+    check(adjustGone, 'the adjust panel goes away when the user does something else');
+    await glide(page, emptySpot.x, emptySpot.y, 6);
     tubeFaces = await faces(page, tube.id);
     const tubeAft = faceFacing(tubeFaces, body.outerRadius, 1);
     const tubeAftPoint = await screenOf(page, tubeAft.centre);
-    await glide(page, tubeAftPoint.x + 120, emptySpot.y, 15);
+    await glide(page, tubeAftPoint.x + 120, emptySpot.y, 6);
     await bringHeldNodeTo(page, body.outerRadius, tubeAft.centre);
     check((await heldSnap(page)) === 'stack', 'the held boattail snaps onto the tube aft end');
     await shot(page, 'boattail-snapped');
@@ -370,7 +384,7 @@ async function main(): Promise<void> {
     const symmetryText = await page.locator('button[data-control="symmetry"]').textContent();
     check(symmetryText === '×4', 'symmetry set to x4');
     await clickSelector(page, '.bin-item[data-part-name="fin"]');
-    await glide(page, emptySpot.x, emptySpot.y, 15);
+    await glide(page, emptySpot.x, emptySpot.y, 6);
     // On the tube, 60 mm forward of its aft end, a little above the side facing us.
     const angle = (30 * Math.PI) / 180;
     const finPoint = await screenOf(page, [tubeAft.centre[0] - 60, body.outerRadius * Math.sin(angle), body.outerRadius * Math.cos(angle)]);
@@ -384,7 +398,7 @@ async function main(): Promise<void> {
 
     console.log('8. hide the sled');
     await clickSelector(page, '.bin-item[data-part-name="sled"]');
-    await glide(page, emptySpot.x, emptySpot.y, 15);
+    await glide(page, emptySpot.x, emptySpot.y, 6);
     await click(page, emptySpot.x, emptySpot.y);
     doc = await documentOf(page);
     const sled = one(doc, names, 'sled');
@@ -419,7 +433,26 @@ async function main(): Promise<void> {
     await page.waitForTimeout(150);
     await shot(page, 'final-from-tail');
 
-    console.log('10. check the assembly');
+    console.log('10. orbit around the finished rocket (look for speckle at every angle)');
+    await fitView(page);
+    const orbitStart = { x: canvas.x + canvas.width * 0.3, y: canvas.y + canvas.height * 0.9 };
+    const drags = [
+      [220, -60],
+      [260, 120],
+      [-200, -160],
+    ];
+    for (let i = 0; i < drags.length; i++) {
+      await glide(page, orbitStart.x, orbitStart.y, 2);
+      await page.mouse.down();
+      await glide(page, orbitStart.x + drags[i][0], orbitStart.y + drags[i][1], 10);
+      await page.mouse.up();
+      await clickSelector(page, 'button[data-view="fit"]');
+      await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 2);
+      await page.waitForTimeout(150);
+      await shot(page, 'orbit-' + String(i + 1));
+    }
+
+    console.log('11. check the assembly');
     doc = await documentOf(page);
     const sections = ['nose', 'can', 'tube', 'boattail'];
     const stations: number[] = [];

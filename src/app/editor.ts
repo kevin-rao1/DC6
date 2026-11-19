@@ -20,7 +20,7 @@ import type { Part } from '../geometry/part.ts';
 import type { Vec3 } from '../geometry/vec3.ts';
 import { add, cross, dot, scale, sub } from '../geometry/vec3.ts';
 import type { Quat, RigidTransform } from '../geometry/transform.ts';
-import { applyToPoint, compose, multiplyQuat, quatFromAxisAngle, quatFromUnitVectors, rotateVector } from '../geometry/transform.ts';
+import { applyToPoint, compose, multiplyQuat, quatAngle, quatFromAxisAngle, quatFromUnitVectors, rotateVector, rotationAboutLine } from '../geometry/transform.ts';
 import { attachToSurface, distanceFromAxis, mateFaces, placeRoot, symmetryTransforms } from '../geometry/mating.ts';
 import { AFT_DIRECTION, AXIS_ORIGIN, NOSE_DIRECTION, WORLD_UP } from '../geometry/rocket-axis.ts';
 import type { AssemblyDocument, Joint } from '../model/document.ts';
@@ -86,6 +86,35 @@ interface Press {
   moved: boolean;
 }
 
+// The direction "sideways" completes the rocket frame: along the rocket
+// (towards the tail), up, and sideways (towards the viewer in the side view).
+export const SIDE_DIRECTION: Vec3 = cross(AFT_DIRECTION, WORLD_UP);
+
+// The last move or rotate made with a gizmo, which the user can adjust by
+// typing exact values, as in Blender's "Adjust Last Operation" panel. The
+// values are that operation's own: how far it moved along each rocket
+// direction, or how far it turned about which one; not coordinates.
+export type LastOperation =
+  | {
+      kind: 'move';
+      placedId: string;
+      // The document before the operation, and the part's pose in it.
+      before: AssemblyDocument;
+      startPose: RigidTransform;
+      along: number;
+      up: number;
+      side: number;
+    }
+  | {
+      kind: 'rotate';
+      placedId: string;
+      before: AssemblyDocument;
+      startPose: RigidTransform;
+      pivot: Vec3;
+      axis: 'along' | 'up' | 'side';
+      degrees: number;
+    };
+
 export interface EditorEvents {
   // Something the panels show has changed.
   changed(): void;
@@ -115,6 +144,7 @@ export class Editor {
   private readonly activeMarker = new Markers(17, true, accent);
 
   readonly gizmo: PartGizmo;
+  lastOperation: LastOperation | null = null;
   // The committed pose of the selected part when a gizmo drag began.
   private gizmoStartPose: RigidTransform | null = null;
 
@@ -244,7 +274,10 @@ export class Editor {
     return requirePart(this.parts, partId).guessedAttachFace;
   }
 
+  // Every edit is one undo step. Any edit other than adjusting it ends the
+  // last operation's panel.
   private commit(next: AssemblyDocument): void {
+    this.lastOperation = null;
     this.history.commit(next);
     this.showCommitted();
   }
@@ -260,6 +293,7 @@ export class Editor {
   }
 
   undo(): void {
+    this.lastOperation = null;
     this.cancelHeld();
     if (this.history.undo()) {
       this.showCommitted();
@@ -267,6 +301,7 @@ export class Editor {
   }
 
   redo(): void {
+    this.lastOperation = null;
     this.cancelHeld();
     if (this.history.redo()) {
       this.showCommitted();
@@ -295,7 +330,7 @@ export class Editor {
         if (geometry === undefined) {
           continue;
         }
-        entry = { visual: new PartVisual(geometry), partId: placed.partId };
+        entry = { visual: new PartVisual(geometry, depthBiasOf(placed.id)), partId: placed.partId };
         this.visuals.set(placed.id, entry);
         this.view.partsGroup.add(entry.visual.group);
       }
@@ -400,7 +435,10 @@ export class Editor {
       if (held.shownIds.length > 0) {
         heldPlaced = findPlaced(this.shown, held.shownIds[0]);
       }
-      if (heldPlaced !== null) {
+      // The held part's own nodes, except while it stands on a surface,
+      // where they mean nothing and only crowd the cursor.
+      const onSurface = held.snap !== null && held.snap.kind === 'surface';
+      if (heldPlaced !== null && !onSurface) {
         const part = requirePart(this.parts, heldPlaced.partId);
         for (let f = 0; f < part.attachFaces.length; f++) {
           const centre = worldFace(this.parts, heldPlaced, f).centre;
@@ -568,8 +606,11 @@ export class Editor {
 
   // Pick up a new part from the parts list.
   pickNew(partId: string): void {
+    this.lastOperation = null;
     this.cancelHeld();
     this.chosenFace = null;
+    // While a new part is held nothing else is selected (as in KSP).
+    this.selectedId = null;
     const rotation = this.holdingRotation(partId);
     this.held = {
       partId: partId,
@@ -609,6 +650,7 @@ export class Editor {
     };
     this.selectedId = null;
     this.hoverId = null;
+    this.lastOperation = null;
     this.updateHeld();
     this.notify();
   }
@@ -956,6 +998,7 @@ export class Editor {
   }
 
   select(placedId: string | null): void {
+    this.lastOperation = null;
     this.selectedId = placedId;
     this.chosenFace = null;
     this.syncScene();
@@ -1049,8 +1092,45 @@ export class Editor {
     if (this.selectedId === null || start === null) {
       return;
     }
+    const placedId = this.selectedId;
+    const before = this.history.document;
     const pose = compose(motion, start);
-    this.commit(movePart(this.history.document, this.selectedId, pose));
+    this.commit(movePart(before, placedId, pose));
+    this.lastOperation = describeOperation(this.tool, placedId, before, start, motion, this.gizmo.pivotPoint());
+    this.notify();
+  }
+
+  // Re-do the last operation with exact values typed by the user: for a
+  // move [along, up, side] in mm, for a rotate [degrees]. It replaces the
+  // operation (one undo step), it does not add to it.
+  adjustLastOperation(values: number[]): void {
+    const operation = this.lastOperation;
+    if (operation === null) {
+      return;
+    }
+    let motion: RigidTransform;
+    if (operation.kind === 'move') {
+      if (values.length !== 3) {
+        throw new Error('adjustLastOperation: a move takes 3 values, got ' + String(values.length));
+      }
+      operation.along = values[0];
+      operation.up = values[1];
+      operation.side = values[2];
+      const alongPart = scale(AFT_DIRECTION, values[0]);
+      const upPart = scale(WORLD_UP, values[1]);
+      const sidePart = scale(SIDE_DIRECTION, values[2]);
+      motion = { position: add(add(alongPart, upPart), sidePart), rotation: [0, 0, 0, 1] };
+    } else {
+      if (values.length !== 1) {
+        throw new Error('adjustLastOperation: a rotate takes 1 value, got ' + String(values.length));
+      }
+      operation.degrees = values[0];
+      const axis = rocketDirection(operation.axis);
+      motion = rotationAboutLine(operation.pivot, axis, (values[0] * Math.PI) / 180);
+    }
+    const pose = compose(motion, operation.startPose);
+    this.history.replace(movePart(operation.before, operation.placedId, pose));
+    this.showCommitted();
   }
 
   private setModifiers(shift: boolean, ctrl: boolean): void {
@@ -1060,22 +1140,11 @@ export class Editor {
     }
   }
 
-  // Numeric entry from the inspector: the selected part's middle goes to
-  // `pivot`, turned to `rotation`.
-  setSelectedPlacement(pivot: Vec3, rotation: Quat): void {
-    if (this.selectedId === null) {
-      return;
-    }
-    const placed = requirePlaced(this.history.document, this.selectedId);
-    const middle = partCentre(requirePart(this.parts, placed.partId));
-    const position = sub(pivot, rotateVector(rotation, middle));
-    this.commit(movePart(this.history.document, this.selectedId, { position: position, rotation: rotation }));
-  }
-
   // -------------------------------------------------------------------------
   // Commands (toolbar, keys, panels).
 
   setTool(tool: Tool): void {
+    this.lastOperation = null;
     this.cancelHeld();
     this.tool = tool;
     this.chosenFace = null;
@@ -1164,8 +1233,9 @@ export class Editor {
     let size = 700;
     if (bounds !== null) {
       centre = scale(add(bounds.min, bounds.max), 0.5);
+      // The box's diagonal: it fits from any direction, not only the side.
       const extent = sub(bounds.max, bounds.min);
-      size = Math.max(100, extent[0], extent[1], extent[2]);
+      size = Math.max(100, Math.hypot(extent[0], extent[1], extent[2]));
     }
     // Along the axis the rocket is small; frame its diameter.
     if ((preset === 'nose' || preset === 'tail') && bounds !== null) {
@@ -1279,6 +1349,79 @@ export class Editor {
     const world = worldFace(this.parts, placed, face);
     return { centre: world.centre, normal: world.normal, radius: world.radius };
   }
+}
+
+// A fixed depth bias per placed part, from its id ("p12" -> 12 mod 4), so it
+// never changes from frame to frame.
+function depthBiasOf(placedId: string): number {
+  const number = parseInt(placedId.replace(/\D/g, ''), 10);
+  if (!Number.isFinite(number)) {
+    return 0;
+  }
+  return number % 4;
+}
+
+function rocketDirection(name: 'along' | 'up' | 'side'): Vec3 {
+  if (name === 'along') {
+    return AFT_DIRECTION;
+  }
+  if (name === 'up') {
+    return WORLD_UP;
+  }
+  return SIDE_DIRECTION;
+}
+
+// What a finished gizmo drag did, in the rocket's own terms.
+function describeOperation(
+  tool: Tool,
+  placedId: string,
+  before: AssemblyDocument,
+  startPose: RigidTransform,
+  motion: RigidTransform,
+  pivot: Vec3,
+): LastOperation {
+  if (tool === 'move') {
+    const offset = motion.position;
+    return {
+      kind: 'move',
+      placedId: placedId,
+      before: before,
+      startPose: startPose,
+      along: dot(offset, AFT_DIRECTION),
+      up: dot(offset, WORLD_UP),
+      side: dot(offset, SIDE_DIRECTION),
+    };
+  }
+  // The gizmo turns about one world axis at a time; find which, and the
+  // signed angle about the matching rocket direction.
+  const q = motion.rotation;
+  const angle = quatAngle(q);
+  const names: Array<'along' | 'up' | 'side'> = ['along', 'up', 'side'];
+  let bestName: 'along' | 'up' | 'side' = 'along';
+  let bestComponent = 0;
+  for (let i = 0; i < names.length; i++) {
+    const direction = rocketDirection(names[i]);
+    const component = q[0] * direction[0] + q[1] * direction[1] + q[2] * direction[2];
+    if (Math.abs(component) > Math.abs(bestComponent)) {
+      bestComponent = component;
+      bestName = names[i];
+    }
+  }
+  // quatAngle uses |w|; the sign of the vector part along the axis (times
+  // the sign of w) says which way round.
+  let sign = bestComponent >= 0 ? 1 : -1;
+  if (q[3] < 0) {
+    sign = -sign;
+  }
+  return {
+    kind: 'rotate',
+    placedId: placedId,
+    before: before,
+    startPose: startPose,
+    pivot: pivot,
+    axis: bestName,
+    degrees: (sign * angle * 180) / Math.PI,
+  };
 }
 
 function memberIds(doc: AssemblyDocument, placedId: string): string[] {

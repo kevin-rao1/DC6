@@ -18,7 +18,7 @@ export function renderThumbnail(part: Part, orientation: RigidTransform): string
   const scene = new THREE.Scene();
   scene.add(new THREE.HemisphereLight(0xffffff, 0x303034, 1.6));
   const geometry = makePartGeometry(part);
-  const visual = new PartVisual(geometry);
+  const visual = new PartVisual(geometry, 0);
   applyTransform(visual.group, orientation);
   scene.add(visual.group);
 
@@ -41,7 +41,6 @@ export function renderThumbnail(part: Part, orientation: RigidTransform): string
   renderer.render(scene, camera);
   const url = renderer.domElement.toDataURL('image/png');
   geometry.mesh.dispose();
-  geometry.edges.dispose();
   visual.dispose();
   return url;
 }

@@ -8,11 +8,15 @@ import type { RigidTransform } from '../geometry/transform.ts';
 
 export const accent = 0xe64097;
 const partColour = 0x9b9ba0;
-const edgeColour = 0x2a2a2e;
 
+// The part's triangles as a three.js geometry, shared by every placed copy.
+//
+// CAD edges are not drawn. Drawn as lines they showed through walls in
+// speckles (thread edges through the nose wall, the can's internals through
+// the tube), and neither the slicers nor the KSP editor draw them: the
+// shading shows the shape. Part.edges is kept for the later stages.
 export interface PartGeometry {
   mesh: THREE.BufferGeometry;
-  edges: THREE.BufferGeometry;
 }
 
 export function makePartGeometry(part: Part): PartGeometry {
@@ -21,30 +25,7 @@ export function makePartGeometry(part: Part): PartGeometry {
   mesh.setAttribute('normal', new THREE.BufferAttribute(part.normals, 3));
   mesh.setIndex(new THREE.BufferAttribute(part.indices, 1));
   mesh.computeBoundingSphere();
-
-  // CAD edges as line segments: each polyline becomes consecutive pairs.
-  let segmentCount = 0;
-  for (let e = 0; e < part.edges.length; e++) {
-    const pointCount = part.edges[e].points.length / 3;
-    if (pointCount >= 2) {
-      segmentCount = segmentCount + pointCount - 1;
-    }
-  }
-  const linePositions = new Float32Array(segmentCount * 6);
-  let cursor = 0;
-  for (let e = 0; e < part.edges.length; e++) {
-    const points = part.edges[e].points;
-    const pointCount = points.length / 3;
-    for (let i = 0; i + 1 < pointCount; i++) {
-      for (let k = 0; k < 6; k++) {
-        linePositions[cursor + k] = points[3 * i + k];
-      }
-      cursor = cursor + 6;
-    }
-  }
-  const edges = new THREE.BufferGeometry();
-  edges.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
-  return { mesh: mesh, edges: edges };
+  return { mesh: mesh };
 }
 
 export function applyTransform(object: THREE.Object3D, transform: RigidTransform): void {
@@ -59,26 +40,28 @@ export type Highlight = 'none' | 'hover' | 'selected';
 export class PartVisual {
   readonly group: THREE.Group;
   private readonly material: THREE.MeshStandardMaterial;
-  private readonly edgeMaterial: THREE.LineBasicMaterial;
   private highlight: Highlight = 'none';
   private floating = false;
 
-  constructor(geometry: PartGeometry) {
+  // depthBias: a small whole number, different for neighbouring parts. Where
+  // two parts' surfaces coincide (a part pushed into another of the same
+  // size), the one with the smaller bias wins every frame instead of the two
+  // flickering. Doubt: surfaces that coincide only up to their tessellation
+  // (two different meshes of one cylinder) still differ by up to the 0.05 mm
+  // chord error, which no fixed bias can hide.
+  constructor(geometry: PartGeometry, depthBias: number) {
     this.material = new THREE.MeshStandardMaterial({
       color: partColour,
       roughness: 0.55,
       metalness: 0.05,
       side: THREE.DoubleSide,
       polygonOffset: true,
-      polygonOffsetFactor: 1,
-      polygonOffsetUnits: 1,
+      polygonOffsetFactor: 0,
+      polygonOffsetUnits: depthBias,
     });
-    this.edgeMaterial = new THREE.LineBasicMaterial({ color: edgeColour });
     const mesh = new THREE.Mesh(geometry.mesh, this.material);
-    const lines = new THREE.LineSegments(geometry.edges, this.edgeMaterial);
     this.group = new THREE.Group();
     this.group.add(mesh);
-    this.group.add(lines);
   }
 
   setHighlight(highlight: Highlight): void {
@@ -103,15 +86,12 @@ export class PartVisual {
     if (this.highlight === 'selected') {
       this.material.emissive.setHex(accent);
       this.material.emissiveIntensity = 0.22;
-      this.edgeMaterial.color.setHex(accent);
     } else if (this.highlight === 'hover') {
       this.material.emissive.setHex(0xffffff);
       this.material.emissiveIntensity = 0.12;
-      this.edgeMaterial.color.setHex(edgeColour);
     } else {
       this.material.emissive.setHex(0x000000);
       this.material.emissiveIntensity = 0;
-      this.edgeMaterial.color.setHex(edgeColour);
     }
     this.material.transparent = this.floating;
     this.material.opacity = this.floating ? 0.45 : 1;
@@ -121,7 +101,6 @@ export class PartVisual {
 
   dispose(): void {
     this.material.dispose();
-    this.edgeMaterial.dispose();
   }
 }
 

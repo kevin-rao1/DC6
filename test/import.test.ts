@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { loadModel, loadPart } from './models.ts';
-import { body, canard, tube, can } from '../tools/test-model-dimensions.ts';
+import { body, canard, tube, can, nose } from '../tools/test-model-dimensions.ts';
 
 function extent(min: number[], max: number[]): number[] {
   const sizes = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
@@ -60,6 +60,15 @@ describe('STEP import', () => {
     const canPart = await loadPart('can');
     // The helical thread is swept, so it comes out as freeform faces.
     expect(canPart.faces.some((f) => f.surface === 'freeform')).toBe(true);
+  });
+
+  it('reads the threaded nose at its true size, thread and all', async () => {
+    const part = await loadPart('nose');
+    const sizes = extent(part.boundsMin, part.boundsMax);
+    expect(sizes[2]).toBeCloseTo(nose.length, 2);
+    expect(sizes[0]).toBeCloseTo(2 * body.outerRadius, 1);
+    // The female thread is a swept helix: freeform faces.
+    expect(part.faces.some((f) => f.surface === 'freeform')).toBe(true);
   });
 
   it('keeps CAD edges with circles marked', async () => {

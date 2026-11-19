@@ -99,6 +99,7 @@ export class View {
       for (let i = 0; i < self.beforeRender.length; i++) {
         self.beforeRender[i]();
       }
+      self.fitDepthRange();
       self.renderer.render(self.scene, self.camera);
       const elapsed = performance.now() - start;
       self.frameTimes.push(elapsed);
@@ -131,6 +132,32 @@ export class View {
     this.camera.lookAt(this.controls.target);
     this.controls.update();
     this.requestRender();
+  }
+
+  // Fit the camera's near and far planes tightly around what is drawn. With
+  // a loose range (1 mm to 20 m) the depth buffer cannot tell apart surfaces
+  // a few millimetres apart at the usual viewing distance, and edges and
+  // internals behind a thin wall speckle through it. Done every frame, as
+  // the camera and the parts move.
+  private fitDepthRange(): void {
+    const box = new THREE.Box3();
+    box.expandByObject(this.partsGroup);
+    box.expandByObject(this.overlayGroup);
+    if (box.isEmpty()) {
+      return;
+    }
+    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    const distance = this.camera.position.distanceTo(sphere.center);
+    // A margin for the gizmo, which can reach a little outside the parts.
+    const radius = sphere.radius * 1.2 + 10;
+    const near = Math.max(0.5, distance - radius);
+    const far = distance + radius;
+    if (near === this.camera.near && far === this.camera.far) {
+      return;
+    }
+    this.camera.near = near;
+    this.camera.far = far;
+    this.camera.updateProjectionMatrix();
   }
 
   // Keep the current view direction, and frame `size` mm around `centre`.
@@ -182,7 +209,12 @@ export class View {
 
   // Millimetres per pixel at a world point, for screen-sized things.
   millimetresPerPixel(point: Vec3): number {
-    const distance = this.camera.position.distanceTo(new THREE.Vector3(point[0], point[1], point[2]));
+    // Depth along the view direction, not straight-line distance: off the
+    // centre of the view the two differ, and only depth sets the scale.
+    const toPoint = new THREE.Vector3(point[0], point[1], point[2]).sub(this.camera.position);
+    const forward = new THREE.Vector3();
+    this.camera.getWorldDirection(forward);
+    const distance = toPoint.dot(forward);
     const height = this.canvas.getBoundingClientRect().height;
     const viewHeight = 2 * distance * Math.tan((this.camera.fov * Math.PI) / 360);
     return viewHeight / Math.max(1, height);

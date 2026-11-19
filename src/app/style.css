@@ -300,7 +300,7 @@ button {
   text-overflow: ellipsis;
 }
 
-.eye {
+.row-button {
   width: 24px;
   height: 22px;
   display: flex;
@@ -309,91 +309,68 @@ button {
   color: var(--faint);
 }
 
-.tree-row:hover .eye,
+.tree-row:hover .row-button,
 .tree-row.hidden-part .eye {
   color: var(--quiet);
 }
 
-.eye:hover {
+.row-button:hover {
   color: var(--text) !important;
 }
 
-/* Inspector, bottom right, only with a selection. */
-.inspector {
+/* Adjust last operation (as Blender): bottom left, beside the parts list,
+   only after a gizmo move or rotate. */
+.adjust {
   position: absolute;
-  right: 8px;
+  left: 92px;
   bottom: 8px;
-  padding: 6px 8px 8px;
+  padding: 6px 8px 7px;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 7px;
 }
 
-.inspector-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 4px;
-}
-
-.inspector-title {
-  color: var(--text);
-}
-
-.icon-button {
-  width: 24px;
-  height: 22px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.adjust-title {
   color: var(--quiet);
-  border-radius: 4px;
+  margin-bottom: 3px;
 }
 
-.icon-button:hover {
-  color: var(--accent);
-}
-
-.inspector-row {
+.adjust-row {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   margin-top: 3px;
 }
 
-.inspector-label {
-  width: 52px;
+.adjust-label {
+  width: 38px;
   color: var(--quiet);
 }
 
-.field {
-  display: flex;
-  align-items: center;
+.adjust-row input {
+  width: 64px;
+  padding: 3px 5px;
   background: #0a0a0c;
   border: 1px solid var(--line);
   border-radius: 4px;
-  padding-left: 5px;
-}
-
-.field:focus-within {
-  border-color: var(--accent);
-}
-
-.axis {
-  color: var(--faint);
-  font-size: 10px;
-}
-
-.field input {
-  width: 58px;
-  padding: 3px 5px 3px 4px;
-  background: none;
-  border: none;
   outline: none;
   color: var(--text);
   font-family: var(--mono);
   font-size: 11px;
   text-align: right;
+}
+
+.adjust-row input:focus {
+  border-color: var(--accent);
+}
+
+/* The delete button on a tree row shows only on hover. */
+.tree-row .remove {
+  visibility: hidden;
+}
+
+.tree-row:hover .remove {
+  visibility: visible;
 }
 
 .unit {
