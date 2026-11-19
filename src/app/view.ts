@@ -110,12 +110,7 @@ export class View {
 
   // Look at `centre` from a preset direction, from far enough to see `size` mm.
   setPreset(preset: PresetView, centre: Vec3, size: number): void {
-    // Distance at which `size` fits the narrower of the two view angles.
-    const verticalAngle = (this.camera.fov * Math.PI) / 180;
-    const aspect = Math.max(0.2, this.camera.aspect);
-    const horizontalAngle = 2 * Math.atan(Math.tan(verticalAngle / 2) * aspect);
-    const fitAngle = Math.min(verticalAngle, horizontalAngle);
-    const distance = (size / 2 / Math.tan(fitAngle / 2)) * 1.1;
+    const distance = this.distanceToFit(size);
     let direction: Vec3 = [0, 0, 1];
     if (preset === 'side') {
       // From the side, a little above: the axis still runs straight across
@@ -136,6 +131,26 @@ export class View {
     this.camera.lookAt(this.controls.target);
     this.controls.update();
     this.requestRender();
+  }
+
+  // Keep the current view direction, and frame `size` mm around `centre`.
+  fit(centre: Vec3, size: number): void {
+    const direction = this.viewDirection();
+    const distance = this.distanceToFit(size);
+    this.controls.target.set(centre[0], centre[1], centre[2]);
+    this.camera.position.set(centre[0] - direction[0] * distance, centre[1] - direction[1] * distance, centre[2] - direction[2] * distance);
+    this.camera.lookAt(this.controls.target);
+    this.controls.update();
+    this.requestRender();
+  }
+
+  // Distance at which `size` mm fits the narrower of the two view angles.
+  private distanceToFit(size: number): number {
+    const verticalAngle = (this.camera.fov * Math.PI) / 180;
+    const aspect = Math.max(0.2, this.camera.aspect);
+    const horizontalAngle = 2 * Math.atan(Math.tan(verticalAngle / 2) * aspect);
+    const fitAngle = Math.min(verticalAngle, horizontalAngle);
+    return (size / 2 / Math.tan(fitAngle / 2)) * 1.1;
   }
 
   // Ray through a point given in client (page) pixels.

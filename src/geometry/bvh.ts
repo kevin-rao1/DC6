@@ -1,6 +1,5 @@
 // A bounding volume hierarchy over a part's triangles, for ray casts:
-// picking under the cursor (60 times a second while a part is held) and the
-// clearance test in attach-faces.ts.
+// picking under the cursor (60 times a second while a part is held).
 //
 // Built once per part, top down: split the triangles at the median of their
 // centres along the longest axis of their box, until a node holds at most

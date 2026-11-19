@@ -86,14 +86,11 @@ export function pickPart(doc: AssemblyDocument, parts: PartLibrary, origin: Vec3
     if (hit === null) {
       continue;
     }
-    // Smooth normal: the CAD normals at the triangle's corners, averaged.
-    const t = hit.triangle;
-    let normal: Vec3 = [0, 0, 0];
-    for (let corner = 0; corner < 3; corner++) {
-      const vertex = part.indices[3 * t + corner];
-      const cornerNormal: Vec3 = [part.normals[3 * vertex], part.normals[3 * vertex + 1], part.normals[3 * vertex + 2]];
-      normal = add(normal, cornerNormal);
-    }
+    // Smooth normal: the CAD normals at the triangle's corners, blended by
+    // where the hit lies in the triangle. On a tessellated cylinder this is
+    // exactly radial, so a fin attached there stands square to the tube.
+    const localPoint = add(localOrigin, scale(localDirection, hit.distance));
+    const normal = interpolatedNormal(part, hit.triangle, localPoint);
     if (length(normal) === 0) {
       continue;
     }
@@ -130,6 +127,33 @@ export function pickFace(doc: AssemblyDocument, parts: PartLibrary, origin: Vec3
     }
   }
   return best;
+}
+
+function vertexOf(array: Float32Array, vertex: number): Vec3 {
+  return [array[3 * vertex], array[3 * vertex + 1], array[3 * vertex + 2]];
+}
+
+// The corner normals of triangle t blended with the barycentric weights of
+// point p (which lies in the triangle).
+function interpolatedNormal(part: Part, t: number, p: Vec3): Vec3 {
+  const ia = part.indices[3 * t];
+  const ib = part.indices[3 * t + 1];
+  const ic = part.indices[3 * t + 2];
+  const a = vertexOf(part.positions, ia);
+  const b = vertexOf(part.positions, ib);
+  const c = vertexOf(part.positions, ic);
+  const whole = length(cross(sub(b, a), sub(c, a)));
+  if (whole === 0) {
+    return [0, 0, 0];
+  }
+  // Each weight is the area of the sub-triangle opposite its corner.
+  const weightA = length(cross(sub(b, p), sub(c, p))) / whole;
+  const weightB = length(cross(sub(c, p), sub(a, p))) / whole;
+  const weightC = length(cross(sub(a, p), sub(b, p))) / whole;
+  const fromA = scale(vertexOf(part.normals, ia), weightA);
+  const fromB = scale(vertexOf(part.normals, ib), weightB);
+  const fromC = scale(vertexOf(part.normals, ic), weightC);
+  return add(add(fromA, fromB), fromC);
 }
 
 export function sameFace(a: FaceRef | null, b: FaceRef | null): boolean {

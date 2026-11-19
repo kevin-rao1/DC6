@@ -1,7 +1,14 @@
 // The assembly editor: what happens when the user points, clicks, drags and
 // presses keys in the 3D view. Behaviour follows the KSP vehicle editor
 // (pick a part, it follows the cursor, it snaps on, click drops it) and the
-// slicers' "place on face" tool.
+// slicers' "lay on face" tool.
+//
+// The jobs are split by file:
+//   picking.ts        what is under the cursor; attach faces in the world
+//   stack-snap.ts     which node of the held part goes onto which node
+//   place-on-face.ts  the place on face operations on the document
+//   gizmo.ts          the move and rotate gizmos
+// This file holds the state and wires them to the pointer and the keys.
 //
 // State lives in two places:
 //   - history.document: the committed assembly (what undo steps through);
@@ -9,32 +16,20 @@
 //     dragged, `shown` is a preview made from the committed document by the
 //     same operations a drop would commit, so what you see is what you get.
 
-import * as THREE from 'three';
-import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
-import type { AttachFace, Part } from '../geometry/part.ts';
+import type { Part } from '../geometry/part.ts';
 import type { Vec3 } from '../geometry/vec3.ts';
-import { add, cross, dot, length, normalize, scale, sub } from '../geometry/vec3.ts';
+import { add, cross, dot, scale, sub } from '../geometry/vec3.ts';
 import type { Quat, RigidTransform } from '../geometry/transform.ts';
-import {
-  applyToDirection,
-  applyToPoint,
-  invert,
-  multiplyQuat,
-  quatFromAxisAngle,
-  quatFromUnitVectors,
-  rotateVector,
-} from '../geometry/transform.ts';
+import { applyToPoint, compose, multiplyQuat, quatFromAxisAngle, quatFromUnitVectors, rotateVector } from '../geometry/transform.ts';
 import { attachToSurface, distanceFromAxis, mateFaces, placeRoot, symmetryTransforms } from '../geometry/mating.ts';
-import { AFT_DIRECTION, NOSE_DIRECTION } from '../geometry/rocket-axis.ts';
-import { raycast } from '../geometry/bvh.ts';
-import type { AssemblyDocument, Joint, PlacedPart } from '../model/document.ts';
+import { AFT_DIRECTION, AXIS_ORIGIN, NOSE_DIRECTION, WORLD_UP } from '../geometry/rocket-axis.ts';
+import type { AssemblyDocument, Joint } from '../model/document.ts';
 import {
   addParts,
   cloneDocument,
   emptyDocument,
   findPlaced,
   movePart,
-  rememberAttachFace,
   removeParts,
   requirePlaced,
   setHidden,
@@ -46,23 +41,23 @@ import { View } from './view.ts';
 import type { PresetView } from './view.ts';
 import type { PartGeometry, Highlight } from './part-visuals.ts';
 import { FacePatch, Markers, PartVisual, accent, applyTransform, makePartGeometry } from './part-visuals.ts';
+import type { FaceRef, PartHit } from './picking.ts';
+import { partCentre, pickFace, pickPart, requirePart, sameFace, worldFace } from './picking.ts';
+import type { StackPair } from './stack-snap.ts';
+import { findStackPair, freeFaces } from './stack-snap.ts';
+import { faceOnFace, faceOnSurface, rootOnFace } from './place-on-face.ts';
+import { PartGizmo } from './gizmo.ts';
 
 export type Tool = 'place' | 'move' | 'rotate' | 'face';
 
 export const symmetryChoices = [1, 2, 3, 4, 6, 8];
 
-// Screen distances for stack snapping, in CSS pixels. A node pair snaps
-// when the held node comes within snapEnter of a free node, and stays
-// snapped until it is moved farther than snapExit (hysteresis: no flicker at
-// the edge).
-const snapEnter = 30;
-const snapExit = 55;
-// A press that moves less than this is a click, not a drag.
+// A press that moves less than this (CSS pixels) is a click, not a drag.
 const clickSlop = 5;
 
 type Snap =
   | { kind: 'root' }
-  | { kind: 'stack'; targetId: string; targetFace: number; ownFace: number }
+  | { kind: 'stack'; pair: StackPair }
   | { kind: 'surface'; targetId: string; point: Vec3; normal: Vec3 };
 
 interface Held {
@@ -71,7 +66,7 @@ interface Held {
   pickedId: string | null;
   // Orientation while floating (the user can turn it with Q/E/W/S/A/D).
   floatingRotation: Quat;
-  // From the cursor's point on the work plane to the attach face centre.
+  // From the cursor's point on the work plane to the part's middle.
   grabOffset: Vec3;
   // Extra turn about the joint normal once snapped (Q/E).
   roll: number;
@@ -83,16 +78,12 @@ interface Held {
   pose: RigidTransform;
 }
 
-interface PartHit {
-  placedId: string;
-  point: Vec3;
-  normal: Vec3;
-  distance: number;
-}
-
-interface PatchRef {
-  placedId: string;
-  face: number;
+interface Press {
+  x: number;
+  y: number;
+  button: number;
+  onPart: string | null;
+  moved: boolean;
 }
 
 export interface EditorEvents {
@@ -111,29 +102,26 @@ export class Editor {
 
   tool: Tool = 'place';
   symmetryCount = 1;
-  angleSnap = true;
   selectedId: string | null = null;
   private held: Held | null = null;
   // Place on face: the face chosen on the selected part, waiting for a target.
   private chosenFace: number | null = null;
 
   private hoverId: string | null = null;
-  private hoverPatch: PatchRef | null = null;
+  private hoverFace: FaceRef | null = null;
   private readonly patches = new Map<string, FacePatch>();
   private readonly targetMarkers = new Markers(13, false, accent);
   private readonly heldMarkers = new Markers(9, false, 0xffffff);
   private readonly activeMarker = new Markers(17, true, accent);
 
-  private readonly gizmo: TransformControls;
-  private readonly gizmoProxy = new THREE.Object3D();
-  private gizmoStart: RigidTransform | null = null;
+  readonly gizmo: PartGizmo;
+  // The committed pose of the selected part when a gizmo drag began.
+  private gizmoStartPose: RigidTransform | null = null;
 
   private pointerX = 0;
   private pointerY = 0;
   private pointerInside = false;
-  private press: { x: number; y: number; button: number; onPart: string | null; moved: boolean } | null = null;
-  private shiftDown = false;
-  private ctrlDown = false;
+  private press: Press | null = null;
   private updateQueued = false;
   private readonly listeners: EditorEvents[] = [];
 
@@ -143,35 +131,26 @@ export class Editor {
     this.view.overlayGroup.add(this.heldMarkers.points);
     this.view.overlayGroup.add(this.activeMarker.points);
 
-    this.gizmo = new TransformControls(this.view.camera, this.view.canvas);
-    this.gizmo.setSpace('world');
-    this.gizmo.setSize(0.8);
-    this.view.scene.add(this.gizmoProxy);
-    this.view.scene.add(this.gizmo.getHelper());
-    this.applyAngleSnap();
     const self = this;
-    this.gizmo.addEventListener('dragging-changed', function onDragging(event) {
-      const dragging = (event as unknown as { value: boolean }).value;
-      self.view.controls.enabled = !dragging;
-      if (dragging) {
-        self.gizmoStart = self.proxyTransform();
-      } else {
-        self.finishGizmoDrag();
-      }
-    });
-    this.gizmo.addEventListener('objectChange', function onGizmoMove() {
-      self.gizmoMoved();
-    });
-    this.gizmo.addEventListener('change', function onGizmoChange() {
-      self.view.requestRender();
+    this.gizmo = new PartGizmo(this.view, container, {
+      preview: function preview(motion: RigidTransform) {
+        self.gizmoPreview(motion);
+      },
+      commit: function commit(motion: RigidTransform) {
+        self.gizmoCommit(motion);
+      },
     });
 
     const canvas = this.view.canvas;
     // Capture phase: these run before the orbit controls' own listeners, so
     // a press that picks or drops a part can switch orbiting off first.
-    canvas.addEventListener('pointerdown', function down(event) {
-      self.onPointerDown(event);
-    }, true);
+    canvas.addEventListener(
+      'pointerdown',
+      function down(event) {
+        self.onPointerDown(event);
+      },
+      true,
+    );
     window.addEventListener('pointermove', function move(event) {
       self.onPointerMove(event);
     });
@@ -189,9 +168,10 @@ export class Editor {
       self.onKeyDown(event);
     });
     window.addEventListener('keyup', function key(event) {
-      self.shiftDown = event.shiftKey;
-      self.ctrlDown = event.ctrlKey || event.metaKey;
-      self.applyAngleSnap();
+      self.setModifiers(event.shiftKey, event.ctrlKey || event.metaKey);
+    });
+    window.addEventListener('blur', function lostFocus() {
+      self.setModifiers(false, false);
     });
     this.view.controls.addEventListener('change', function cameraMoved() {
       // Screen-space snapping depends on the camera.
@@ -240,19 +220,19 @@ export class Editor {
     return this.held.snap.kind;
   }
 
+  // The id the held part has in the shown document (for the test hook).
+  heldShownId(): string | null {
+    if (this.held === null || this.held.shownIds.length === 0) {
+      return null;
+    }
+    return this.held.shownIds[0];
+  }
+
   heldPartId(): string | null {
     if (this.held === null) {
       return null;
     }
     return this.held.partId;
-  }
-
-  private requirePart(partId: string): Part {
-    const part = this.parts.get(partId);
-    if (part === undefined) {
-      throw new Error('expected a loaded part with id ' + partId);
-    }
-    return part;
   }
 
   // The attach face of a source part: the user's choice, else the guess.
@@ -261,7 +241,7 @@ export class Editor {
     if (chosen !== undefined) {
       return chosen;
     }
-    return this.requirePart(partId).guessedAttachFace;
+    return requirePart(this.parts, partId).guessedAttachFace;
   }
 
   private commit(next: AssemblyDocument): void {
@@ -336,12 +316,30 @@ export class Editor {
     this.view.requestRender();
   }
 
-  private updateHighlights(): void {
+  // The ids of the selected part's symmetry set (empty when nothing is selected).
+  private selectedSet(): Set<string> {
     const selected = new Set<string>();
-    if (this.selectedId !== null && findPlaced(this.shown, this.selectedId) !== null && this.held === null) {
-      const members = symmetryMembers(this.shown, this.selectedId);
+    if (this.selectedId === null || this.held !== null) {
+      return selected;
+    }
+    if (findPlaced(this.shown, this.selectedId) === null) {
+      return selected;
+    }
+    const members = symmetryMembers(this.shown, this.selectedId);
+    for (let i = 0; i < members.length; i++) {
+      selected.add(members[i].id);
+    }
+    return selected;
+  }
+
+  private updateHighlights(): void {
+    const selected = this.selectedSet();
+    const hovered = new Set<string>();
+    if (this.hoverId !== null && findPlaced(this.shown, this.hoverId) !== null) {
+      // Hover lights the whole symmetry set, as selection does.
+      const members = symmetryMembers(this.shown, this.hoverId);
       for (let i = 0; i < members.length; i++) {
-        selected.add(members[i].id);
+        hovered.add(members[i].id);
       }
     }
     const heldIds = new Set<string>();
@@ -352,123 +350,67 @@ export class Editor {
       }
       floating = this.held.snap === null;
     }
-    const hoverId = this.hoverId;
-    const shown = this.shown;
     this.visuals.forEach(function setHighlight(entry, id) {
       let highlight: Highlight = 'none';
       if (selected.has(id)) {
         highlight = 'selected';
-      } else if (hoverId !== null && id === hoverId) {
+      } else if (hovered.has(id)) {
         highlight = 'hover';
-      }
-      // Hover lights the whole symmetry set, as selection does.
-      if (highlight === 'none' && hoverId !== null && findPlaced(shown, hoverId) !== null) {
-        const placed = findPlaced(shown, id);
-        const hovered = findPlaced(shown, hoverId);
-        if (placed !== null && hovered !== null && placed.symmetry !== null && hovered.symmetry !== null) {
-          if (placed.symmetry.group === hovered.symmetry.group) {
-            highlight = 'hover';
-          }
-        }
       }
       entry.visual.setHighlight(highlight);
       entry.visual.setFloating(heldIds.has(id) && floating);
     });
   }
 
-  // The world position of a placed part's attach face.
-  worldFace(placed: PlacedPart, faceIndex: number): AttachFace {
-    const part = this.requirePart(placed.partId);
-    const face = part.attachFaces[faceIndex];
-    const outline: Vec3[] = [];
-    for (let i = 0; i < face.outline.length; i++) {
-      outline.push(applyToPoint(placed.transform, face.outline[i]));
+  // Everything that moves with the held part, in the committed document.
+  private movingWithHeld(): Set<string> {
+    const moving = new Set<string>();
+    if (this.held === null || this.held.pickedId === null) {
+      return moving;
     }
-    return {
-      normal: applyToDirection(placed.transform, face.normal),
-      centre: applyToPoint(placed.transform, face.centre),
-      outline: outline,
-      area: face.area,
-      radius: face.radius,
-      longDirection: applyToDirection(placed.transform, face.longDirection),
-    };
+    const committed = this.history.document;
+    const members = symmetryMembers(committed, this.held.pickedId);
+    for (let m = 0; m < members.length; m++) {
+      const subtree = subtreeIds(committed, members[m].id);
+      for (let k = 0; k < subtree.length; k++) {
+        moving.add(subtree[k]);
+      }
+    }
+    return moving;
   }
 
-  // Attach faces already used by a joint, per placed part.
-  private usedFaces(doc: AssemblyDocument): Map<string, Set<number>> {
-    const used = new Map<string, Set<number>>();
-    for (let i = 0; i < doc.placed.length; i++) {
-      const placed = doc.placed[i];
-      if (placed.joint === null) {
-        continue;
-      }
-      const own = used.get(placed.id) ?? new Set<number>();
-      own.add(placed.joint.ownFace);
-      used.set(placed.id, own);
-      if (placed.parentId !== null && placed.joint.parentFace !== null) {
-        const parentSet = used.get(placed.parentId) ?? new Set<number>();
-        parentSet.add(placed.joint.parentFace);
-        used.set(placed.parentId, parentSet);
-      }
-    }
-    return used;
-  }
-
-  // Free attach nodes of visible parts that are not moving with the held part.
-  private freeNodes(): PatchRef[] {
-    const nodes: PatchRef[] = [];
-    const doc = this.shown;
-    const used = this.usedFaces(doc);
-    const excluded = new Set<string>();
-    if (this.held !== null) {
-      for (let i = 0; i < this.held.shownIds.length; i++) {
-        excluded.add(this.held.shownIds[i]);
-      }
-    }
-    for (let i = 0; i < doc.placed.length; i++) {
-      const placed = doc.placed[i];
-      if (placed.hidden || excluded.has(placed.id)) {
-        continue;
-      }
-      const part = this.requirePart(placed.partId);
-      const usedHere = used.get(placed.id);
-      for (let f = 0; f < part.attachFaces.length; f++) {
-        if (usedHere !== undefined && usedHere.has(f)) {
-          continue;
-        }
-        nodes.push({ placedId: placed.id, face: f });
-      }
-    }
-    return nodes;
-  }
-
+  // Attach nodes show while a part is held (not for the root, which has
+  // nothing to attach to): rings on the rocket's free faces, small white
+  // rings on the held part's faces, a filled dot on the node it snapped to.
   private updateMarkers(): void {
     const targets: number[] = [];
     const heldPoints: number[] = [];
     const active: number[] = [];
-    // Nodes show only while a part is held, and not for the root (it has
-    // nothing to attach to).
-    const heldSnap = this.held === null ? null : this.held.snap;
-    const placingRoot = heldSnap !== null && heldSnap.kind === 'root';
-    if (this.held !== null && !placingRoot) {
-      const nodes = this.freeNodes();
+    const held = this.held;
+    const placingRoot = held !== null && held.snap !== null && held.snap.kind === 'root';
+    if (held !== null && !placingRoot) {
+      const shownMoving = new Set<string>(held.shownIds);
+      const nodes = freeFaces(this.shown, this.parts, shownMoving);
       for (let i = 0; i < nodes.length; i++) {
         const placed = requirePlaced(this.shown, nodes[i].placedId);
-        const centre = this.worldFace(placed, nodes[i].face).centre;
+        const centre = worldFace(this.parts, placed, nodes[i].face).centre;
         targets.push(centre[0], centre[1], centre[2]);
       }
-      const heldPlaced = findPlaced(this.shown, this.held.shownIds[0]);
+      let heldPlaced = null;
+      if (held.shownIds.length > 0) {
+        heldPlaced = findPlaced(this.shown, held.shownIds[0]);
+      }
       if (heldPlaced !== null) {
-        const part = this.requirePart(heldPlaced.partId);
+        const part = requirePart(this.parts, heldPlaced.partId);
         for (let f = 0; f < part.attachFaces.length; f++) {
-          const centre = this.worldFace(heldPlaced, f).centre;
+          const centre = worldFace(this.parts, heldPlaced, f).centre;
           heldPoints.push(centre[0], centre[1], centre[2]);
         }
       }
-      const snap = this.held.snap;
+      const snap = held.snap;
       if (snap !== null && snap.kind === 'stack') {
-        const target = requirePlaced(this.shown, snap.targetId);
-        const centre = this.worldFace(target, snap.targetFace).centre;
+        const target = requirePlaced(this.shown, snap.pair.targetId);
+        const centre = worldFace(this.parts, target, snap.pair.targetFace).centre;
         active.push(centre[0], centre[1], centre[2]);
       }
     }
@@ -477,9 +419,11 @@ export class Editor {
     this.activeMarker.setPositions(active);
   }
 
-  // The face patches place on face shows.
-  private wantedPatches(): PatchRef[] {
-    const wanted: PatchRef[] = [];
+  // The face patches place on face shows: the selected part's faces, and
+  // once one is chosen, the faces of every other visible part not moving
+  // with it.
+  private offeredFaces(): FaceRef[] {
+    const wanted: FaceRef[] = [];
     if (this.tool !== 'face' || this.held !== null || this.selectedId === null) {
       return wanted;
     }
@@ -487,36 +431,36 @@ export class Editor {
     if (selected === null || selected.hidden) {
       return wanted;
     }
-    const part = this.requirePart(selected.partId);
+    const part = requirePart(this.parts, selected.partId);
     for (let f = 0; f < part.attachFaces.length; f++) {
       wanted.push({ placedId: selected.id, face: f });
     }
-    if (this.chosenFace !== null) {
-      // Targets: faces of every other visible part not moving with this one.
-      const moving = new Set<string>();
-      const members = symmetryMembers(this.shown, selected.id);
-      for (let m = 0; m < members.length; m++) {
-        const subtree = subtreeIds(this.shown, members[m].id);
-        for (let k = 0; k < subtree.length; k++) {
-          moving.add(subtree[k]);
-        }
+    if (this.chosenFace === null) {
+      return wanted;
+    }
+    const moving = new Set<string>();
+    const members = symmetryMembers(this.shown, selected.id);
+    for (let m = 0; m < members.length; m++) {
+      const subtree = subtreeIds(this.shown, members[m].id);
+      for (let k = 0; k < subtree.length; k++) {
+        moving.add(subtree[k]);
       }
-      for (let i = 0; i < this.shown.placed.length; i++) {
-        const other = this.shown.placed[i];
-        if (other.hidden || moving.has(other.id)) {
-          continue;
-        }
-        const otherPart = this.requirePart(other.partId);
-        for (let f = 0; f < otherPart.attachFaces.length; f++) {
-          wanted.push({ placedId: other.id, face: f });
-        }
+    }
+    for (let i = 0; i < this.shown.placed.length; i++) {
+      const other = this.shown.placed[i];
+      if (other.hidden || moving.has(other.id)) {
+        continue;
+      }
+      const otherPart = requirePart(this.parts, other.partId);
+      for (let f = 0; f < otherPart.attachFaces.length; f++) {
+        wanted.push({ placedId: other.id, face: f });
       }
     }
     return wanted;
   }
 
   private updatePatches(): void {
-    const wanted = this.wantedPatches();
+    const wanted = this.offeredFaces();
     const keep = new Set<string>();
     for (let i = 0; i < wanted.length; i++) {
       const ref = wanted[i];
@@ -526,20 +470,21 @@ export class Editor {
       keep.add(key);
       let patch = this.patches.get(key);
       if (patch === undefined) {
-        patch = new FacePatch(this.worldFace(placed, ref.face));
+        patch = new FacePatch(worldFace(this.parts, placed, ref.face));
         this.patches.set(key, patch);
         this.view.overlayGroup.add(patch.group);
       }
       const onSelected = ref.placedId === this.selectedId;
-      const hovered = this.hoverPatch !== null && this.hoverPatch.placedId === ref.placedId && this.hoverPatch.face === ref.face;
+      const hovered = sameFace(this.hoverFace, ref);
       if (onSelected && this.chosenFace === ref.face) {
         patch.setState('chosen');
       } else if (hovered) {
         patch.setState('hover');
-      } else if (onSelected) {
-        patch.setState(this.chosenFace === null ? 'idle' : 'dim');
-      } else {
+      } else if (onSelected && this.chosenFace !== null) {
+        // The other faces of the part being placed step back.
         patch.setState('dim');
+      } else {
+        patch.setState('idle');
       }
     }
     const self = this;
@@ -552,91 +497,36 @@ export class Editor {
     });
   }
 
-  private updateGizmo(): void {
-    const show = (this.tool === 'move' || this.tool === 'rotate') && this.held === null && this.selectedId !== null;
-    if (!show || this.selectedId === null) {
-      this.gizmo.detach();
-      return;
+  // The world point the gizmos turn about and the inspector shows: the
+  // middle of the selected part's bounding box.
+  selectedPivot(): Vec3 | null {
+    if (this.selectedId === null) {
+      return null;
     }
     const placed = findPlaced(this.shown, this.selectedId);
-    if (placed === null || placed.hidden) {
-      this.gizmo.detach();
+    if (placed === null) {
+      return null;
+    }
+    const part = requirePart(this.parts, placed.partId);
+    return applyToPoint(placed.transform, partCentre(part));
+  }
+
+  private updateGizmo(): void {
+    const wanted = (this.tool === 'move' || this.tool === 'rotate') && this.held === null;
+    const pivot = this.selectedPivot();
+    let placed = null;
+    if (this.selectedId !== null) {
+      placed = findPlaced(this.shown, this.selectedId);
+    }
+    if (!wanted || pivot === null || placed === null || placed.hidden) {
+      this.gizmo.hide();
       return;
     }
-    if (this.gizmo.dragging) {
-      return;
-    }
-    this.gizmo.setMode(this.tool === 'move' ? 'translate' : 'rotate');
-    applyTransform(this.gizmoProxy, placed.transform);
-    if (this.gizmo.object !== this.gizmoProxy) {
-      this.gizmo.attach(this.gizmoProxy);
-    }
+    this.gizmo.show(this.tool === 'move' ? 'move' : 'rotate', pivot);
   }
 
   // -------------------------------------------------------------------------
-  // Picking.
-
-  private pickPart(origin: Vec3, direction: Vec3, exclude: Set<string>): PartHit | null {
-    let best: PartHit | null = null;
-    for (let i = 0; i < this.shown.placed.length; i++) {
-      const placed = this.shown.placed[i];
-      if (placed.hidden || exclude.has(placed.id)) {
-        continue;
-      }
-      const part = this.requirePart(placed.partId);
-      // Into the part's frame; rigid, so distances are unchanged.
-      const toLocal = invert(placed.transform);
-      const localOrigin = applyToPoint(toLocal, origin);
-      const localDirection = applyToDirection(toLocal, direction);
-      const limit = best === null ? Infinity : best.distance;
-      const hit = raycast(part.bvh, part.positions, part.indices, localOrigin, localDirection, limit);
-      if (hit === null) {
-        continue;
-      }
-      // Smooth normal: the CAD normals at the triangle's corners, averaged.
-      const t = hit.triangle;
-      let normal: Vec3 = [0, 0, 0];
-      for (let corner = 0; corner < 3; corner++) {
-        const vertex = part.indices[3 * t + corner];
-        normal = add(normal, [part.normals[3 * vertex], part.normals[3 * vertex + 1], part.normals[3 * vertex + 2]]);
-      }
-      if (length(normal) === 0) {
-        continue;
-      }
-      let worldNormal = normalize(applyToDirection(placed.transform, normal));
-      // Facing the viewer: on a thin wall the ray may hit the inside.
-      if (dot(worldNormal, direction) > 0) {
-        worldNormal = scale(worldNormal, -1);
-      }
-      const point = add(origin, scale(direction, hit.distance));
-      best = { placedId: placed.id, point: point, normal: worldNormal, distance: hit.distance };
-    }
-    return best;
-  }
-
-  // The nearest offered patch under the ray.
-  private pickPatch(origin: Vec3, direction: Vec3, refs: PatchRef[]): PatchRef | null {
-    let best: PatchRef | null = null;
-    let bestDistance = Infinity;
-    for (let i = 0; i < refs.length; i++) {
-      const placed = requirePlaced(this.shown, refs[i].placedId);
-      const face = this.worldFace(placed, refs[i].face);
-      const along = dot(direction, face.normal);
-      if (Math.abs(along) < 1e-6) {
-        continue;
-      }
-      const distance = dot(sub(face.centre, origin), face.normal) / along;
-      if (distance <= 0 || distance >= bestDistance) {
-        continue;
-      }
-      const point = add(origin, scale(direction, distance));
-      if (insideConvex(face.outline, face.normal, point)) {
-        best = refs[i];
-        bestDistance = distance;
-      }
-    }
-    return best;
-  }
+  // Holding parts.
 
   // Where the cursor ray meets the plane facing the camera through the orbit
   // centre: held parts float at the rocket's depth, as in KSP.
@@ -649,14 +539,11 @@ export class Editor {
     return add(origin, scale(direction, distance));
   }
 
-  // -------------------------------------------------------------------------
-  // Holding parts.
-
   // The orientation a new part is held in: a section (attach face round)
   // with its attach face aft, so it lines up with the rocket; anything else
   // (a fin) standing on its attach face with its long side along the axis.
   private holdingRotation(partId: string): Quat {
-    const part = this.requirePart(partId);
+    const part = requirePart(this.parts, partId);
     const faceIndex = this.attachFaceOf(partId);
     if (faceIndex < 0) {
       return [0, 0, 0, 1];
@@ -665,7 +552,7 @@ export class Editor {
     if (face.radius !== null) {
       return quatFromUnitVectors(face.normal, AFT_DIRECTION);
     }
-    const down: Vec3 = [0, -1, 0];
+    const down = scale(WORLD_UP, -1);
     const first = quatFromUnitVectors(face.normal, down);
     const long = rotateVector(first, face.longDirection);
     const sine = dot(cross(long, NOSE_DIRECTION), down);
@@ -683,16 +570,17 @@ export class Editor {
   pickNew(partId: string): void {
     this.cancelHeld();
     this.chosenFace = null;
+    const rotation = this.holdingRotation(partId);
     this.held = {
       partId: partId,
       pickedId: null,
-      floatingRotation: this.holdingRotation(partId),
+      floatingRotation: rotation,
       grabOffset: [0, 0, 0],
       roll: 0,
       snap: null,
       dragging: false,
       shownIds: [],
-      pose: { position: [0, 0, 0], rotation: this.holdingRotation(partId) },
+      pose: { position: [0, 0, 0], rotation: rotation },
     };
     this.updateHeld();
     this.notify();
@@ -701,16 +589,13 @@ export class Editor {
   // Pick up a placed part (and its children, and its symmetry set).
   private pickUp(placedId: string, dragging: boolean): void {
     const placed = requirePlaced(this.history.document, placedId);
-    const faceIndex = this.attachFaceOf(placed.partId);
-    let anchor = placed.transform.position;
-    if (faceIndex >= 0) {
-      anchor = this.worldFace(placed, faceIndex).centre;
-    }
+    const part = requirePart(this.parts, placed.partId);
+    const middle = applyToPoint(placed.transform, partCentre(part));
     const ray = this.view.rayAt(this.pointerX, this.pointerY);
     const onPlane = this.workPlanePoint(ray.origin, ray.direction);
-    // Keep the part where it is under the cursor: the anchor stays at the
+    // Keep the part where it is under the cursor: its middle stays at the
     // same offset from the cursor's point on the work plane.
-    const grabOffset = sub(anchor, onPlane);
+    const grabOffset = sub(middle, onPlane);
     this.held = {
       partId: placed.partId,
       pickedId: placedId,
@@ -753,21 +638,18 @@ export class Editor {
     });
   }
 
-  // How many copies a placement makes.
-  private copiesFor(snap: Snap | null, held: Held): number {
+  // How many copies a new placement makes: one for a section on the axis
+  // (nowhere to put copies), the symmetry count for anything off it.
+  private copiesFor(snap: Snap | null, held: Held, pose: RigidTransform): number {
     if (held.pickedId !== null) {
       return 1; // movePart carries the symmetry set of a picked-up part
     }
     if (snap === null || snap.kind === 'root') {
       return 1;
     }
-    if (snap.kind === 'stack') {
-      const target = requirePlaced(this.history.document, snap.targetId);
-      const centre = this.worldFace(target, snap.targetFace).centre;
-      // A section stacked on the axis has nowhere to put copies.
-      if (distanceFromAxis(centre) < 0.5) {
-        return 1;
-      }
+    const middle = applyToPoint(pose, partCentre(requirePart(this.parts, held.partId)));
+    if (distanceFromAxis(middle) < 0.5) {
+      return 1;
     }
     return this.symmetryCount;
   }
@@ -779,55 +661,50 @@ export class Editor {
       return;
     }
     const committed = this.history.document;
-    const part = this.requirePart(held.partId);
+    const part = requirePart(this.parts, held.partId);
     const faceIndex = this.attachFaceOf(held.partId);
-    let attachCentre: Vec3 = [
-      (part.boundsMin[0] + part.boundsMax[0]) / 2,
-      (part.boundsMin[1] + part.boundsMax[1]) / 2,
-      (part.boundsMin[2] + part.boundsMax[2]) / 2,
-    ];
-    if (faceIndex >= 0) {
-      attachCentre = part.attachFaces[faceIndex].centre;
-    }
+    const middle = partCentre(part);
     const ray = this.view.rayAt(this.pointerX, this.pointerY);
-    const onPlane = add(this.workPlanePoint(ray.origin, ray.direction), held.grabOffset);
+    const cursorPoint = add(this.workPlanePoint(ray.origin, ray.direction), held.grabOffset);
     const floatingPose: RigidTransform = {
       rotation: held.floatingRotation,
-      position: sub(onPlane, rotateVector(held.floatingRotation, attachCentre)),
+      position: sub(cursorPoint, rotateVector(held.floatingRotation, middle)),
     };
-
-    // The parts the held part can attach to: committed, visible, and not
-    // moving with it.
-    const moving = new Set<string>();
-    if (held.pickedId !== null) {
-      const members = symmetryMembers(committed, held.pickedId);
-      for (let m = 0; m < members.length; m++) {
-        const subtree = subtreeIds(committed, members[m].id);
-        for (let k = 0; k < subtree.length; k++) {
-          moving.add(subtree[k]);
-        }
-      }
-    }
+    const moving = this.movingWithHeld();
     const becomesRoot = committed.rootId === null || committed.rootId === held.pickedId;
 
     let snap: Snap | null = null;
     let pose = floatingPose;
     if (becomesRoot) {
+      // The root lies on the axis, attach face aft, and slides along the
+      // axis with the cursor.
       snap = { kind: 'root' };
       if (faceIndex >= 0) {
-        pose = placeRoot(part.attachFaces[faceIndex], floatingPose, held.roll);
+        const onAxis = placeRoot(part.attachFaces[faceIndex], floatingPose, held.roll);
+        const middleNow = applyToPoint(onAxis, middle);
+        const cursorStation = dot(sub(cursorPoint, AXIS_ORIGIN), NOSE_DIRECTION);
+        const middleStation = dot(sub(middleNow, AXIS_ORIGIN), NOSE_DIRECTION);
+        const slide = scale(NOSE_DIRECTION, cursorStation - middleStation);
+        pose = { position: add(onAxis.position, slide), rotation: onAxis.rotation };
       }
     } else {
-      snap = this.findStackSnap(held, floatingPose, moving);
-      if (snap !== null && snap.kind === 'stack') {
-        const target = requirePlaced(committed, snap.targetId);
-        const targetFace = this.worldFace(target, snap.targetFace);
-        pose = mateFaces(part.attachFaces[snap.ownFace], floatingPose, targetFace.centre, targetFace.normal, held.roll);
+      let current: StackPair | null = null;
+      if (held.snap !== null && held.snap.kind === 'stack') {
+        current = held.snap.pair;
+      }
+      const view = this.view;
+      const pair = findStackPair(committed, this.parts, part, floatingPose, moving, current, function toScreen(point: Vec3) {
+        return view.toScreen(point);
+      });
+      if (pair !== null) {
+        snap = { kind: 'stack', pair: pair };
+        const target = worldFace(this.parts, requirePlaced(committed, pair.targetId), pair.targetFace);
+        pose = mateFaces(part.attachFaces[pair.ownFace], floatingPose, target.centre, target.normal, held.roll);
       } else if (faceIndex >= 0 && this.pointerInside) {
-        const hit = this.pickPart(ray.origin, ray.direction, moving);
+        const hit = pickPart(committed, this.parts, ray.origin, ray.direction, moving);
         if (hit !== null) {
           snap = { kind: 'surface', targetId: hit.placedId, point: hit.point, normal: hit.normal };
-          pose = attachToSurface(part.attachFaces[faceIndex], partCentre(part), floatingPose, hit.point, hit.normal, held.roll);
+          pose = attachToSurface(part.attachFaces[faceIndex], middle, floatingPose, hit.point, hit.normal, held.roll);
         }
       }
     }
@@ -838,100 +715,8 @@ export class Editor {
     const preview = this.placementResult(held, pose, snap);
     this.shown = preview.doc;
     held.shownIds = preview.movingIds;
+    this.view.canvas.style.cursor = 'grabbing';
     this.syncScene();
-  }
-
-  // Stack snap: the held part's attach nodes against the free nodes of the
-  // rocket, by distance on screen. A pair whose discs have the same radius
-  // (a nose base onto a tube end) is preferred over one that does not (the
-  // nose's shoulder end onto the tube end), so sections join the way they
-  // are meant to.
-  private findStackSnap(held: Held, floatingPose: RigidTransform, moving: Set<string>): Snap | null {
-    const part = this.requirePart(held.partId);
-    if (part.attachFaces.length === 0) {
-      return null;
-    }
-    const committed = this.history.document;
-    const used = this.usedFaces(committed);
-    interface Pair {
-      targetId: string;
-      targetFace: number;
-      ownFace: number;
-      distance: number;
-      matched: boolean;
-    }
-    const pairs: Pair[] = [];
-    const heldScreen: Array<{ x: number; y: number; inFront: boolean }> = [];
-    for (let f = 0; f < part.attachFaces.length; f++) {
-      heldScreen.push(this.view.toScreen(applyToPoint(floatingPose, part.attachFaces[f].centre)));
-    }
-    for (let i = 0; i < committed.placed.length; i++) {
-      const target = committed.placed[i];
-      if (target.hidden || moving.has(target.id)) {
-        continue;
-      }
-      const targetPart = this.requirePart(target.partId);
-      const usedHere = used.get(target.id);
-      for (let t = 0; t < targetPart.attachFaces.length; t++) {
-        if (usedHere !== undefined && usedHere.has(t)) {
-          continue;
-        }
-        const targetFace = targetPart.attachFaces[t];
-        const screen = this.view.toScreen(applyToPoint(target.transform, targetFace.centre));
-        if (!screen.inFront) {
-          continue;
-        }
-        for (let f = 0; f < part.attachFaces.length; f++) {
-          const own = part.attachFaces[f];
-          const distance = Math.hypot(heldScreen[f].x - screen.x, heldScreen[f].y - screen.y);
-          let matched = false;
-          if (own.radius !== null && targetFace.radius !== null) {
-            matched = Math.abs(own.radius - targetFace.radius) <= 0.02 * targetFace.radius;
-          }
-          pairs.push({ targetId: target.id, targetFace: t, ownFace: f, distance: distance, matched: matched });
-        }
-      }
-    }
-    // Hysteresis: keep the current pair while it is within snapExit, unless
-    // a better kind of pair (matched radius) has come within snapEnter.
-    const current = held.snap;
-    let kept: Pair | null = null;
-    if (current !== null && current.kind === 'stack') {
-      for (let i = 0; i < pairs.length; i++) {
-        const pair = pairs[i];
-        if (pair.targetId === current.targetId && pair.targetFace === current.targetFace && pair.ownFace === current.ownFace) {
-          if (pair.distance < snapExit) {
-            kept = pair;
-          }
-        }
-      }
-    }
-    let best: Pair | null = null;
-    for (let i = 0; i < pairs.length; i++) {
-      const pair = pairs[i];
-      if (pair.distance > snapEnter) {
-        continue;
-      }
-      if (best === null) {
-        best = pair;
-      } else if (pair.matched && !best.matched) {
-        best = pair;
-      } else if (pair.matched === best.matched && pair.distance < best.distance) {
-        best = pair;
-      }
-    }
-    let chosen: Pair | null = kept;
-    if (best !== null) {
-      if (kept === null) {
-        chosen = best;
-      } else if (best.matched && !kept.matched) {
-        chosen = best;
-      }
-    }
-    if (chosen === null) {
-      return null;
-    }
-    return { kind: 'stack', targetId: chosen.targetId, targetFace: chosen.targetFace, ownFace: chosen.ownFace };
   }
 
   // The document a drop would commit, and the ids that move with the held part.
@@ -939,18 +724,15 @@ export class Editor {
     const committed = this.history.document;
     let parentId: string | null = null;
     let joint: Joint | null = null;
-    const faceIndex = this.attachFaceOf(held.partId);
     if (snap !== null && snap.kind === 'stack') {
-      parentId = snap.targetId;
-      joint = { ownFace: snap.ownFace, parentFace: snap.targetFace };
+      parentId = snap.pair.targetId;
+      joint = { ownFace: snap.pair.ownFace, parentFace: snap.pair.targetFace };
     } else if (snap !== null && snap.kind === 'surface') {
       parentId = snap.targetId;
-      joint = { ownFace: faceIndex, parentFace: null };
-    } else if (snap !== null && snap.kind === 'root' && faceIndex >= 0) {
-      joint = null;
+      joint = { ownFace: this.attachFaceOf(held.partId), parentFace: null };
     }
     if (held.pickedId === null) {
-      const count = this.copiesFor(snap, held);
+      const count = this.copiesFor(snap, held, pose);
       let transforms: RigidTransform[] = [pose];
       if (count > 1) {
         transforms = symmetryTransforms(pose, count);
@@ -964,7 +746,10 @@ export class Editor {
     for (let m = 0; m < members.length; m++) {
       const member = members[m];
       member.parentId = parentId;
-      member.joint = joint === null ? null : { ownFace: joint.ownFace, parentFace: joint.parentFace };
+      member.joint = null;
+      if (joint !== null) {
+        member.joint = { ownFace: joint.ownFace, parentFace: joint.parentFace };
+      }
       const subtree = subtreeIds(moved, member.id);
       for (let k = 0; k < subtree.length; k++) {
         movingIds.push(subtree[k]);
@@ -992,6 +777,7 @@ export class Editor {
       this.selectedId = result.addedIds[0];
     }
     this.commit(result.doc);
+    this.updateHover();
   }
 
   private turnHeld(axis: Vec3, angle: number): void {
@@ -1009,44 +795,45 @@ export class Editor {
   }
 
   // -------------------------------------------------------------------------
-  // Hover.
+  // Hover and cursor.
 
   private updateHover(): void {
     let hoverId: string | null = null;
-    let hoverPatch: PatchRef | null = null;
+    let hoverFace: FaceRef | null = null;
     let cursor = 'default';
     if (this.pointerInside && !this.gizmo.dragging) {
       const ray = this.view.rayAt(this.pointerX, this.pointerY);
       if (this.tool === 'face') {
-        hoverPatch = this.pickPatch(ray.origin, ray.direction, this.wantedPatches());
+        hoverFace = pickFace(this.shown, this.parts, ray.origin, ray.direction, this.offeredFaces());
       }
-      const hit = this.pickPart(ray.origin, ray.direction, new Set<string>());
+      const hit = pickPart(this.shown, this.parts, ray.origin, ray.direction, new Set<string>());
       if (hit !== null) {
         hoverId = hit.placedId;
       }
-      if (this.gizmo.axis !== null && this.gizmo.object !== undefined) {
-        cursor = 'move';
+      if (this.gizmo.hovered()) {
+        cursor = this.tool === 'move' ? 'move' : 'grab';
         hoverId = null;
-      } else if (hoverPatch !== null) {
+      } else if (hoverFace !== null) {
         cursor = 'pointer';
         hoverId = null;
       } else if (hoverId !== null) {
         if (this.tool === 'place' && hoverId !== this.history.document.rootId) {
           cursor = 'grab';
-        } else if (this.tool === 'face' && this.chosenFace !== null) {
-          cursor = hoverId === this.selectedId ? 'not-allowed' : 'crosshair';
         } else {
           cursor = 'pointer';
         }
       }
     }
-    if (this.press !== null && this.press.button !== 0) {
+    if (this.gizmo.dragging) {
+      cursor = this.tool === 'move' ? 'move' : 'grabbing';
+    }
+    if (this.press !== null && this.press.moved && this.press.button !== 0) {
       cursor = 'move';
     }
     this.view.canvas.style.cursor = cursor;
-    const changed = hoverId !== this.hoverId || !samePatch(hoverPatch, this.hoverPatch);
+    const changed = hoverId !== this.hoverId || !sameFace(hoverFace, this.hoverFace);
     this.hoverId = hoverId;
-    this.hoverPatch = hoverPatch;
+    this.hoverFace = hoverFace;
     if (changed) {
       this.updateHighlights();
       this.updatePatches();
@@ -1061,30 +848,34 @@ export class Editor {
     this.pointerX = event.clientX;
     this.pointerY = event.clientY;
     this.pointerInside = true;
-    this.shiftDown = event.shiftKey;
-    this.ctrlDown = event.ctrlKey || event.metaKey;
+    this.setModifiers(event.shiftKey, event.ctrlKey || event.metaKey);
     let onPart: string | null = null;
     if (event.button === 0 && this.held === null) {
       // The gizmo handles its own presses.
-      if (this.gizmo.object !== undefined && this.gizmo.axis !== null) {
+      if (this.gizmo.hovered()) {
+        // The orbit controls must not turn the view while a handle is dragged.
         this.view.controls.enabled = false;
         this.press = { x: event.clientX, y: event.clientY, button: event.button, onPart: null, moved: true };
         return;
       }
       const ray = this.view.rayAt(event.clientX, event.clientY);
-      const hit = this.pickPart(ray.origin, ray.direction, new Set<string>());
+      const hit = pickPart(this.shown, this.parts, ray.origin, ray.direction, new Set<string>());
       if (hit !== null) {
         onPart = hit.placedId;
       }
-      const patchUnder = this.tool === 'face' ? this.pickPatch(ray.origin, ray.direction, this.wantedPatches()) : null;
+      let faceUnder: FaceRef | null = null;
+      if (this.tool === 'face') {
+        faceUnder = pickFace(this.shown, this.parts, ray.origin, ray.direction, this.offeredFaces());
+      }
       // A press on a part in place mode may become a drag that carries it,
       // so the camera must not orbit.
       const grabbable = this.tool === 'place' && onPart !== null && onPart !== this.history.document.rootId;
-      if (grabbable || patchUnder !== null) {
+      if (grabbable || faceUnder !== null) {
         this.view.controls.enabled = false;
       }
     }
-    if (event.button === 0 && this.held !== null && this.held.dragging) {
+    if (event.button === 0 && this.held !== null) {
+      // A click drops the held part; it must not start an orbit.
       this.view.controls.enabled = false;
     }
     this.press = { x: event.clientX, y: event.clientY, button: event.button, onPart: onPart, moved: false };
@@ -1095,8 +886,10 @@ export class Editor {
     this.pointerY = event.clientY;
     const rect = this.view.canvas.getBoundingClientRect();
     const overCanvas = event.target === this.view.canvas;
-    this.pointerInside = overCanvas && event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
-    this.ctrlDown = event.ctrlKey || event.metaKey;
+    const inRect = event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+    this.pointerInside = overCanvas && inRect;
+    this.setModifiers(event.shiftKey, event.ctrlKey || event.metaKey);
+    this.gizmo.moveLabel(event.clientX, event.clientY);
     const press = this.press;
     if (press !== null && !press.moved) {
       const travelled = Math.hypot(event.clientX - press.x, event.clientY - press.y);
@@ -1115,7 +908,7 @@ export class Editor {
   private onPointerUp(event: PointerEvent): void {
     const press = this.press;
     this.press = null;
-    this.view.controls.enabled = true;
+    this.view.controls.enabled = !this.gizmo.dragging;
     const overCanvas = event.target === this.view.canvas;
     if (press === null) {
       // The press began outside the view (a part dragged in from the list).
@@ -1130,13 +923,7 @@ export class Editor {
     if (press.button === 2) {
       // Right click (not a pan): cancel what is held, or the face choice.
       if (click) {
-        if (this.held !== null) {
-          this.cancelHeld();
-          this.notify();
-        } else if (this.chosenFace !== null) {
-          this.chosenFace = null;
-          this.syncScene();
-        }
+        this.cancel();
       }
       return;
     }
@@ -1175,30 +962,43 @@ export class Editor {
     this.notify();
   }
 
+  // Escape or right click: put what is held back where it came from, or
+  // forget the chosen face, or clear the selection.
+  private cancel(): void {
+    if (this.held !== null) {
+      this.cancelHeld();
+    } else if (this.chosenFace !== null) {
+      this.chosenFace = null;
+      this.syncScene();
+    } else if (this.selectedId !== null) {
+      this.select(null);
+    }
+    this.notify();
+  }
+
   // -------------------------------------------------------------------------
   // Place on face.
 
   private faceClick(clientX: number, clientY: number, onPart: string | null): void {
     const ray = this.view.rayAt(clientX, clientY);
-    const patch = this.pickPatch(ray.origin, ray.direction, this.wantedPatches());
-    const selected = this.selectedId === null ? null : findPlaced(this.history.document, this.selectedId);
+    const doc = this.history.document;
+    const faceUnder = pickFace(this.shown, this.parts, ray.origin, ray.direction, this.offeredFaces());
+    let selected = null;
+    if (this.selectedId !== null) {
+      selected = findPlaced(doc, this.selectedId);
+    }
     if (selected === null) {
       this.select(onPart);
       return;
     }
-    if (patch !== null && patch.placedId === selected.id) {
-      // A face of the selected part.
-      if (selected.id === this.history.document.rootId) {
-        // The root needs nothing else: that face becomes its aft face, on the axis.
-        const face = this.requirePart(selected.partId).attachFaces[patch.face];
-        const pose = placeRoot(face, selected.transform, 0);
-        let next = movePart(this.history.document, selected.id, pose);
-        next = rememberAttachFace(next, selected.partId, patch.face);
+    if (faceUnder !== null && faceUnder.placedId === selected.id) {
+      if (selected.id === doc.rootId) {
+        // The root needs nothing else: that face becomes its aft face.
         this.chosenFace = null;
-        this.commit(next);
+        this.commit(rootOnFace(doc, this.parts, selected.id, faceUnder.face));
         return;
       }
-      this.chosenFace = patch.face;
+      this.chosenFace = faceUnder.face;
       this.syncScene();
       this.notify();
       return;
@@ -1208,102 +1008,68 @@ export class Editor {
       this.select(onPart);
       return;
     }
-    const ownFace = this.requirePart(selected.partId).attachFaces[this.chosenFace];
-    if (patch !== null) {
-      // Face onto face: centred, normals opposed.
-      const target = requirePlaced(this.history.document, patch.placedId);
-      const targetFace = this.worldFace(target, patch.face);
-      const pose = mateFaces(ownFace, selected.transform, targetFace.centre, targetFace.normal, 0);
-      this.finishFacePlacement(selected, pose, patch.placedId, { ownFace: this.chosenFace, parentFace: patch.face });
+    const ownFace = this.chosenFace;
+    this.chosenFace = null;
+    if (faceUnder !== null) {
+      this.commit(faceOnFace(doc, this.parts, selected.id, ownFace, faceUnder.placedId, faceUnder.face));
       return;
     }
     if (onPart !== null && onPart !== selected.id) {
-      // Face onto a point of another part's surface: attached there, standing
-      // out along the surface normal, long side along the axis.
-      const moving = new Set<string>(subtreeIds(this.history.document, selected.id));
-      const hit = this.pickPart(ray.origin, ray.direction, moving);
+      const moving = new Set<string>(subtreeIds(doc, selected.id));
+      const hit: PartHit | null = pickPart(doc, this.parts, ray.origin, ray.direction, moving);
       if (hit !== null) {
-        const part = this.requirePart(selected.partId);
-        const pose = attachToSurface(ownFace, partCentre(part), selected.transform, hit.point, hit.normal, 0);
-        this.finishFacePlacement(selected, pose, hit.placedId, { ownFace: this.chosenFace, parentFace: null });
+        this.commit(faceOnSurface(doc, this.parts, selected.id, ownFace, hit.placedId, hit.point, hit.normal));
         return;
       }
     }
-    // Clicked nothing useful: drop the choice.
-    this.chosenFace = null;
+    // Clicked nothing useful: the choice is dropped.
     this.syncScene();
     this.notify();
-  }
-
-  private finishFacePlacement(selected: PlacedPart, pose: RigidTransform, parentId: string, joint: Joint): void {
-    let next = movePart(this.history.document, selected.id, pose);
-    const members = symmetryMembers(next, selected.id);
-    for (let m = 0; m < members.length; m++) {
-      members[m].parentId = parentId;
-      members[m].joint = { ownFace: joint.ownFace, parentFace: joint.parentFace };
-    }
-    next = rememberAttachFace(next, selected.partId, joint.ownFace);
-    this.chosenFace = null;
-    this.commit(next);
   }
 
   // -------------------------------------------------------------------------
   // Gizmo.
 
-  private proxyTransform(): RigidTransform {
-    const p = this.gizmoProxy.position;
-    const q = this.gizmoProxy.quaternion;
-    return { position: [p.x, p.y, p.z], rotation: [q.x, q.y, q.z, q.w] };
-  }
-
-  private applyAngleSnap(): void {
-    if (!this.angleSnap) {
-      this.gizmo.setRotationSnap(null);
+  private gizmoPreview(motion: RigidTransform): void {
+    if (this.selectedId === null) {
       return;
     }
-    // 15 degrees; hold Shift for 1 degree.
-    const degrees = this.shiftDown ? 1 : 15;
-    this.gizmo.setRotationSnap((degrees * Math.PI) / 180);
-  }
-
-  private gizmoMoved(): void {
-    if (this.selectedId === null || this.gizmoStart === null) {
-      return;
+    if (this.gizmoStartPose === null) {
+      this.gizmoStartPose = requirePlaced(this.history.document, this.selectedId).transform;
     }
-    let pose = this.proxyTransform();
-    if (this.tool === 'move' && this.ctrlDown) {
-      // Ctrl: move in whole millimetres from where the drag began.
-      const start = this.gizmoStart.position;
-      const delta = sub(pose.position, start);
-      const snapped: Vec3 = [Math.round(delta[0]), Math.round(delta[1]), Math.round(delta[2])];
-      pose = { position: add(start, snapped), rotation: pose.rotation };
-      applyTransform(this.gizmoProxy, pose);
-    }
+    const pose = compose(motion, this.gizmoStartPose);
     this.shown = movePart(this.history.document, this.selectedId, pose);
     this.syncScene();
     this.notify();
   }
 
-  private finishGizmoDrag(): void {
-    const start = this.gizmoStart;
-    this.gizmoStart = null;
-    if (start === null || this.selectedId === null) {
+  private gizmoCommit(motion: RigidTransform): void {
+    const start = this.gizmoStartPose;
+    this.gizmoStartPose = null;
+    if (this.selectedId === null || start === null) {
       return;
     }
-    const pose = this.proxyTransform();
-    const moved = length(sub(pose.position, start.position)) > 1e-9 || Math.abs(dot4(pose.rotation, start.rotation)) < 1 - 1e-12;
-    if (!moved) {
-      return;
-    }
+    const pose = compose(motion, start);
     this.commit(movePart(this.history.document, this.selectedId, pose));
   }
 
-  // Numeric entry from the inspector.
-  setSelectedTransform(transform: RigidTransform): void {
+  private setModifiers(shift: boolean, ctrl: boolean): void {
+    this.gizmo.setModifiers(shift, ctrl);
+    if (!this.gizmo.dragging) {
+      this.gizmoStartPose = null;
+    }
+  }
+
+  // Numeric entry from the inspector: the selected part's middle goes to
+  // `pivot`, turned to `rotation`.
+  setSelectedPlacement(pivot: Vec3, rotation: Quat): void {
     if (this.selectedId === null) {
       return;
     }
-    this.commit(movePart(this.history.document, this.selectedId, transform));
+    const placed = requirePlaced(this.history.document, this.selectedId);
+    const middle = partCentre(requirePart(this.parts, placed.partId));
+    const position = sub(pivot, rotateVector(rotation, middle));
+    this.commit(movePart(this.history.document, this.selectedId, { position: position, rotation: rotation }));
   }
 
   // -------------------------------------------------------------------------
@@ -1319,7 +1085,7 @@ export class Editor {
 
   setSymmetry(count: number): void {
     this.symmetryCount = count;
-    // On a selected placed part (not on the axis), change its set.
+    // On a selected placed part off the axis, change its set.
     if (this.held === null && this.selectedId !== null) {
       this.resymmetrise(this.selectedId, count);
     }
@@ -1338,7 +1104,8 @@ export class Editor {
     if (members.length === count) {
       return;
     }
-    if (distanceFromAxis(applyToPoint(placed.transform, partCentre(this.requirePart(placed.partId)))) < 0.5) {
+    const middle = applyToPoint(placed.transform, partCentre(requirePart(this.parts, placed.partId)));
+    if (distanceFromAxis(middle) < 0.5) {
       return;
     }
     for (let m = 0; m < members.length; m++) {
@@ -1347,19 +1114,13 @@ export class Editor {
       }
     }
     const first = members[0];
-    const ids: string[] = [];
-    for (let m = 0; m < members.length; m++) {
-      ids.push(members[m].id);
-    }
+    const ids = memberIds(doc, placedId);
     const without = removeParts(doc, ids);
     let transforms: RigidTransform[] = [first.transform];
     if (count > 1) {
       transforms = symmetryTransforms(first.transform, count);
     }
     const added = addParts(without, { partId: first.partId, transforms: transforms, parentId: first.parentId, joint: first.joint });
-    if (doc.rootId === first.id) {
-      added.doc.rootId = added.ids[0];
-    }
     this.selectedId = added.ids[0];
     this.commit(added.doc);
   }
@@ -1373,12 +1134,6 @@ export class Editor {
     this.setSymmetry(symmetryChoices[index]);
   }
 
-  setAngleSnap(on: boolean): void {
-    this.angleSnap = on;
-    this.applyAngleSnap();
-    this.notify();
-  }
-
   toggleHidden(placedId: string): void {
     const placed = requirePlaced(this.history.document, placedId);
     this.commit(setHidden(this.history.document, placedId, !placed.hidden));
@@ -1389,8 +1144,7 @@ export class Editor {
       const picked = this.held.pickedId;
       this.held = null;
       if (picked !== null) {
-        const ids = symmetryMembers(this.history.document, picked).map(memberId);
-        this.commit(removeParts(this.history.document, ids));
+        this.commit(removeParts(this.history.document, memberIds(this.history.document, picked)));
       } else {
         this.showCommitted();
       }
@@ -1399,7 +1153,7 @@ export class Editor {
     if (this.selectedId === null) {
       return;
     }
-    const ids = symmetryMembers(this.history.document, this.selectedId).map(memberId);
+    const ids = memberIds(this.history.document, this.selectedId);
     this.selectedId = null;
     this.commit(removeParts(this.history.document, ids));
   }
@@ -1410,25 +1164,17 @@ export class Editor {
     let size = 700;
     if (bounds !== null) {
       centre = scale(add(bounds.min, bounds.max), 0.5);
-      size = Math.max(100, length(sub(bounds.max, bounds.min)));
-    }
-    if (preset === 'fit') {
-      // Keep the current direction, frame everything.
-      const direction = this.view.viewDirection();
-      const verticalAngle = (this.view.camera.fov * Math.PI) / 180;
-      const distance = (size / 2 / Math.tan(verticalAngle / 2)) * 1.05;
-      this.view.controls.target.set(centre[0], centre[1], centre[2]);
-      this.view.camera.position.set(centre[0] - direction[0] * distance, centre[1] - direction[1] * distance, centre[2] - direction[2] * distance);
-      this.view.controls.update();
-      this.view.requestRender();
-      return;
+      const extent = sub(bounds.max, bounds.min);
+      size = Math.max(100, extent[0], extent[1], extent[2]);
     }
     // Along the axis the rocket is small; frame its diameter.
-    if (preset === 'nose' || preset === 'tail') {
-      if (bounds !== null) {
-        const extent = sub(bounds.max, bounds.min);
-        size = Math.max(60, Math.hypot(extent[1], extent[2]) * 1.3);
-      }
+    if ((preset === 'nose' || preset === 'tail') && bounds !== null) {
+      const extent = sub(bounds.max, bounds.min);
+      size = Math.max(60, Math.hypot(extent[1], extent[2]) * 1.3);
+    }
+    if (preset === 'fit') {
+      this.view.fit(centre, size);
+      return;
     }
     this.view.setPreset(preset, centre, size);
   }
@@ -1442,7 +1188,7 @@ export class Editor {
       if (placed.hidden) {
         continue;
       }
-      const part = this.requirePart(placed.partId);
+      const part = requirePart(this.parts, placed.partId);
       for (let corner = 0; corner < 8; corner++) {
         const local: Vec3 = [
           corner & 1 ? part.boundsMax[0] : part.boundsMin[0],
@@ -1465,9 +1211,7 @@ export class Editor {
   // Keys.
 
   private onKeyDown(event: KeyboardEvent): void {
-    this.shiftDown = event.shiftKey;
-    this.ctrlDown = event.ctrlKey || event.metaKey;
-    this.applyAngleSnap();
+    this.setModifiers(event.shiftKey, event.ctrlKey || event.metaKey);
     const target = event.target as HTMLElement | null;
     if (target !== null && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
       return;
@@ -1488,15 +1232,7 @@ export class Editor {
       return;
     }
     if (key === 'escape') {
-      if (this.held !== null) {
-        this.cancelHeld();
-      } else if (this.chosenFace !== null) {
-        this.chosenFace = null;
-        this.syncScene();
-      } else {
-        this.select(null);
-      }
-      this.notify();
+      this.cancel();
       return;
     }
     if (key === 'delete' || key === 'backspace') {
@@ -1514,8 +1250,6 @@ export class Editor {
       this.setTool('face');
     } else if (key === 'x') {
       this.stepSymmetry(event.shiftKey ? -1 : 1);
-    } else if (key === 'c') {
-      this.setAngleSnap(!this.angleSnap);
     } else if (this.held !== null) {
       // KSP keys turn the held part: 90 degrees, 15 with Shift.
       const step = ((event.shiftKey ? 15 : 90) * Math.PI) / 180;
@@ -1528,63 +1262,30 @@ export class Editor {
       } else if (key === 's') {
         this.turnHeld([0, 0, 1], -step);
       } else if (key === 'a') {
-        this.turnHeld([0, 1, 0], step);
+        this.turnHeld(WORLD_UP, step);
       } else if (key === 'd') {
-        this.turnHeld([0, 1, 0], -step);
+        this.turnHeld(WORLD_UP, -step);
       }
     }
   }
 
-  // For the panels and the test hook.
   isRoot(placedId: string): boolean {
     return this.history.document.rootId === placedId;
   }
 
-  partOfPlaced(placedId: string): Part {
-    return this.requirePart(requirePlaced(this.shown, placedId).partId);
+  // For the test hook: a placed part's attach face in the world.
+  worldFaceOf(placedId: string, face: number): { centre: Vec3; normal: Vec3; radius: number | null } {
+    const placed = requirePlaced(this.shown, placedId);
+    const world = worldFace(this.parts, placed, face);
+    return { centre: world.centre, normal: world.normal, radius: world.radius };
   }
 }
 
-function memberId(placed: PlacedPart): string {
-  return placed.id;
-}
-
-function samePatch(a: PatchRef | null, b: PatchRef | null): boolean {
-  if (a === null || b === null) {
-    return a === b;
+function memberIds(doc: AssemblyDocument, placedId: string): string[] {
+  const members = symmetryMembers(doc, placedId);
+  const ids: string[] = [];
+  for (let i = 0; i < members.length; i++) {
+    ids.push(members[i].id);
   }
-  return a.placedId === b.placedId && a.face === b.face;
-}
-
-function dot4(a: Quat, b: Quat): number {
-  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
-}
-
-// Centre of the part's bounding box, in its frame.
-function partCentre(part: Part): Vec3 {
-  return [
-    (part.boundsMin[0] + part.boundsMax[0]) / 2,
-    (part.boundsMin[1] + part.boundsMax[1]) / 2,
-    (part.boundsMin[2] + part.boundsMax[2]) / 2,
-  ];
-}
-
-// Is a point (in the plane) inside a convex outline? Same side of every edge.
-function insideConvex(outline: Vec3[], normal: Vec3, point: Vec3): boolean {
-  let sign = 0;
-  for (let i = 0; i < outline.length; i++) {
-    const a = outline[i];
-    const b = outline[(i + 1) % outline.length];
-    const side = dot(cross(sub(b, a), sub(point, a)), normal);
-    if (Math.abs(side) < 1e-12) {
-      continue;
-    }
-    const s = side > 0 ? 1 : -1;
-    if (sign === 0) {
-      sign = s;
-    } else if (s !== sign) {
-      return false;
-    }
-  }
-  return true;
+  return ids;
 }

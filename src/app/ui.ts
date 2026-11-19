@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import type { Editor, Tool } from './editor.ts';
 import type { PresetView } from './view.ts';
 import type { AssemblyDocument, PlacedPart } from '../model/document.ts';
-import { requirePlaced, symmetryMembers } from '../model/document.ts';
+import { findPlaced, requirePlaced, symmetryMembers } from '../model/document.ts';
 import { renderThumbnail } from './thumbnails.ts';
 
 // Stroke icons, 20 x 20 view box.
@@ -55,13 +55,14 @@ export class Ui {
   private readonly fileInput: HTMLInputElement;
   private readonly toolButtons = new Map<Tool, HTMLButtonElement>();
   private readonly symmetryButton: HTMLButtonElement;
-  private readonly snapButton: HTMLButtonElement;
   private readonly undoButton: HTMLButtonElement;
   private readonly redoButton: HTMLButtonElement;
   private readonly thumbnails = new Map<string, string>();
   private readonly pending: PendingFile[] = [];
   private inspectorFor: string | null = null;
   private readonly inputs: HTMLInputElement[] = [];
+  // The text last written into each input, to tell which ones the user changed.
+  private readonly shownTexts: string[] = [];
   private toastTimer = 0;
   private refreshQueued = false;
 
@@ -96,8 +97,8 @@ export class Ui {
     const tools = element('div', 'group', this.topbar);
     const toolList: Array<[Tool, string, string]> = [
       ['place', 'place', 'Place (1)'],
-      ['move', 'move', 'Move (2)'],
-      ['rotate', 'rotate', 'Rotate (3)'],
+      ['move', 'move', 'Move along the axis (2) · Ctrl: any direction · Shift: 0.1 mm'],
+      ['rotate', 'rotate', 'Rotate (3) · 15° steps · Shift: 1°'],
       ['face', 'face', 'Place on face (F)'],
     ];
     for (let i = 0; i < toolList.length; i++) {
@@ -121,12 +122,6 @@ export class Ui {
     this.symmetryButton.addEventListener('contextmenu', function previousSymmetry(event) {
       event.preventDefault();
       editor.stepSymmetry(-1);
-    });
-    this.snapButton = element('button', 'tool text', options);
-    this.snapButton.title = 'Angle snap (C)';
-    this.snapButton.textContent = '15°';
-    this.snapButton.addEventListener('click', function toggleSnap() {
-      editor.setAngleSnap(!editor.angleSnap);
     });
     const history = element('div', 'group', this.topbar);
     this.undoButton = element('button', 'tool', history);
@@ -261,7 +256,6 @@ export class Ui {
     });
     this.symmetryButton.textContent = '×' + String(editor.symmetryCount);
     this.symmetryButton.classList.toggle('active', editor.symmetryCount > 1);
-    this.snapButton.classList.toggle('active', editor.angleSnap);
     this.undoButton.disabled = !editor.history.canUndo();
     this.redoButton.disabled = !editor.history.canRedo();
 
@@ -356,10 +350,8 @@ export class Ui {
       this.inspectorFor = null;
       return;
     }
-    let placed: PlacedPart;
-    try {
-      placed = requirePlaced(shown, selectedId);
-    } catch {
+    const placed = findPlaced(shown, selectedId);
+    if (placed === null) {
       this.inspector.style.display = 'none';
       return;
     }
@@ -368,11 +360,24 @@ export class Ui {
       this.buildInspector(placed);
       this.inspectorFor = selectedId;
     }
-    // Fill in the numbers, except in a field the user is typing in.
-    const values = transformToFields(placed);
+    this.fillInspector(false);
+  }
+
+  // Fill in the numbers; a field the user is typing in is left alone unless
+  // `force` is set.
+  private fillInspector(force: boolean): void {
+    const editor = this.editor;
+    const pivot = editor.selectedPivot();
+    if (pivot === null || editor.selectedId === null) {
+      return;
+    }
+    const placed = requirePlaced(editor.shownDocument, editor.selectedId);
+    const values = placementToFields(pivot, placed);
     for (let i = 0; i < this.inputs.length; i++) {
-      if (document.activeElement !== this.inputs[i]) {
-        this.inputs[i].value = values[i].toFixed(i < 3 ? 2 : 1);
+      if (force || document.activeElement !== this.inputs[i]) {
+        const text = values[i].toFixed(i < 3 ? 2 : 1);
+        this.inputs[i].value = text;
+        this.shownTexts[i] = text;
       }
     }
   }
@@ -424,31 +429,70 @@ export class Ui {
     }
   }
 
+  // Apply what the user typed. Only fields the user changed are read: the
+  // others keep their exact values, so typing a position does not round the
+  // rotation to the one decimal shown (that would tip a part off the axis).
   private applyInspector(): void {
-    const values: number[] = [];
+    const editor = this.editor;
+    const pivot = editor.selectedPivot();
+    if (pivot === null || editor.selectedId === null) {
+      return;
+    }
+    const placed = requirePlaced(editor.shownDocument, editor.selectedId);
+    const values = placementToFields(pivot, placed);
+    let rotationChanged = false;
     for (let i = 0; i < this.inputs.length; i++) {
-      const value = Number(this.inputs[i].value.replace(',', '.'));
-      if (!Number.isFinite(value)) {
-        this.refreshInspector();
+      if (this.inputs[i].value === this.shownTexts[i]) {
+        continue;
+      }
+      const value = evaluateSum(this.inputs[i].value);
+      if (value === null) {
+        // Not a number: put the real values back.
+        this.fillInspector(true);
         return;
       }
-      values.push(value);
+      values[i] = value;
+      if (i >= 3) {
+        rotationChanged = true;
+      }
     }
-    const euler = new THREE.Euler((values[3] * Math.PI) / 180, (values[4] * Math.PI) / 180, (values[5] * Math.PI) / 180, 'XYZ');
-    const quaternion = new THREE.Quaternion().setFromEuler(euler);
-    this.editor.setSelectedTransform({
-      position: [values[0], values[1], values[2]],
-      rotation: [quaternion.x, quaternion.y, quaternion.z, quaternion.w],
-    });
+    let rotation = placed.transform.rotation;
+    if (rotationChanged) {
+      const euler = new THREE.Euler((values[3] * Math.PI) / 180, (values[4] * Math.PI) / 180, (values[5] * Math.PI) / 180, 'XYZ');
+      const quaternion = new THREE.Quaternion().setFromEuler(euler);
+      rotation = [quaternion.x, quaternion.y, quaternion.z, quaternion.w];
+    }
+    editor.setSelectedPlacement([values[0], values[1], values[2]], rotation);
   }
 }
 
-function transformToFields(placed: PlacedPart): number[] {
+// The inspector shows where the middle of the part is (the point the gizmos
+// sit on) and the part's rotation as X, Y, Z angles.
+function placementToFields(pivot: [number, number, number], placed: PlacedPart): number[] {
   const q = placed.transform.rotation;
   const euler = new THREE.Euler().setFromQuaternion(new THREE.Quaternion(q[0], q[1], q[2], q[3]), 'XYZ');
-  const p = placed.transform.position;
   const degrees = 180 / Math.PI;
-  return [p[0], p[1], p[2], euler.x * degrees, euler.y * degrees, euler.z * degrees];
+  return [pivot[0], pivot[1], pivot[2], euler.x * degrees, euler.y * degrees, euler.z * degrees];
+}
+
+// A field may hold a number or a sum such as "-130+12", so a part can be
+// pushed 12 mm by typing "+12" after the value that is there.
+export function evaluateSum(text: string): number | null {
+  const cleaned = text.replace(/\s+/g, '').replace(/,/g, '.').replace(/\u2212/g, '-');
+  const wholePattern = /^[+-]?(\d+\.?\d*|\.\d+)([+-](\d+\.?\d*|\.\d+))*$/;
+  if (!wholePattern.test(cleaned)) {
+    return null;
+  }
+  const termPattern = /[+-]?(\d+\.?\d*|\.\d+)/g;
+  const terms = cleaned.match(termPattern);
+  if (terms === null) {
+    return null;
+  }
+  let total = 0;
+  for (let i = 0; i < terms.length; i++) {
+    total = total + Number(terms[i]);
+  }
+  return total;
 }
 
 function hasFiles(event: DragEvent): boolean {

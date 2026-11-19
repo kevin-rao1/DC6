@@ -5,19 +5,27 @@
 //
 // Run with:   npm run e2e        (builds first, then runs this)
 // Screenshots: one per step, in $DC6_E2E_OUT or the scratch folder below.
+//
+// The rocket built, nose to the left:
+//   nose - can - tube (root) - boattail, four fins on the tube, a sled hidden.
+// The can is snapped onto the tube by the tip of its internals and then
+// pushed 70 mm aft by typing "+70" (its internals go into the tube); the
+// nose is snapped onto the can's spigot and then dragged 12 mm aft with the
+// move gizmo, so it screws over the spigot and its rim meets the can's shoulder.
 
 import { preview } from 'vite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
-import type { Page } from 'playwright';
+import type { Page, Playwright } from './playwright-types.ts';
 import type { AssemblyDocument, PlacedPart } from '../src/model/document.ts';
 import type { TestHook, WorldFace } from '../src/app/test-hook.ts';
 import type { Vec3 } from '../src/geometry/vec3.ts';
+import { body, can } from './test-model-dimensions.ts';
 
 // Playwright is installed on the machine, not as a project dependency.
 const require = createRequire(import.meta.url);
-const playwright = require('playwright') as typeof import('playwright');
+const playwright = require('playwright') as Playwright;
 
 const outputDirectory = process.env.DC6_E2E_OUT ?? '/tmp/claude-0/-home-user-DC6/957e7891-de01-5aa6-b91e-10b2b12b1724/scratchpad/e2e';
 mkdirSync(outputDirectory, { recursive: true });
@@ -39,11 +47,12 @@ function check(condition: boolean, message: string): void {
 }
 
 let stepNumber = 0;
+const runStart = Date.now();
 async function shot(page: Page, name: string): Promise<void> {
   stepNumber = stepNumber + 1;
   const file = join(outputDirectory, String(stepNumber).padStart(2, '0') + '-' + name + '.png');
   await page.screenshot({ path: file });
-  console.log('screenshot ' + file);
+  console.log('  screenshot ' + file + ' at ' + ((Date.now() - runStart) / 1000).toFixed(1) + ' s');
 }
 
 async function documentOf(page: Page): Promise<AssemblyDocument> {
@@ -53,22 +62,43 @@ async function documentOf(page: Page): Promise<AssemblyDocument> {
 }
 
 async function faces(page: Page, placedId: string): Promise<WorldFace[]> {
-  return page.evaluate(function read(id) {
+  return page.evaluate(function read(id: string) {
     return window.dc6.attachFaces(id);
   }, placedId);
 }
 
+async function heldFaces(page: Page): Promise<WorldFace[]> {
+  return page.evaluate(function read() {
+    return window.dc6.heldFaces();
+  });
+}
+
+async function heldSnap(page: Page): Promise<string | null> {
+  return page.evaluate(function read() {
+    return window.dc6.heldSnap();
+  });
+}
+
 async function screenOf(page: Page, point: Vec3): Promise<{ x: number; y: number }> {
-  return page.evaluate(function project(p) {
+  return page.evaluate(function project(p: Vec3) {
     return window.dc6.screenOf(p);
   }, point);
 }
 
+// The mouse, moved in small steps as a hand would, remembering where it is.
+const mouseAt = { x: 0, y: 0 };
+async function glide(page: Page, x: number, y: number, steps: number): Promise<void> {
+  await page.mouse.move(x, y, { steps: steps });
+  mouseAt.x = x;
+  mouseAt.y = y;
+  await page.waitForTimeout(80);
+}
+
 async function click(page: Page, x: number, y: number): Promise<void> {
-  await page.mouse.move(x, y, { steps: 4 });
+  await glide(page, x, y, 4);
   await page.mouse.down();
   await page.mouse.up();
-  await page.waitForTimeout(120);
+  await page.waitForTimeout(100);
 }
 
 async function clickSelector(page: Page, selector: string): Promise<void> {
@@ -79,10 +109,10 @@ async function clickSelector(page: Page, selector: string): Promise<void> {
   await click(page, box.x + box.width / 2, box.y + box.height / 2);
 }
 
-// Glide the mouse to a point in many small moves, as a hand would.
-async function glide(page: Page, x: number, y: number, steps: number): Promise<void> {
-  await page.mouse.move(x, y, { steps: steps });
-  await page.waitForTimeout(120);
+async function fitView(page: Page): Promise<void> {
+  await clickSelector(page, 'button[data-view="side"]');
+  await clickSelector(page, 'button[data-view="fit"]');
+  await page.waitForTimeout(100);
 }
 
 function placedOfPart(doc: AssemblyDocument, names: Record<string, string>, name: string): PlacedPart[] {
@@ -103,23 +133,52 @@ function distance(a: Vec3, b: Vec3): number {
   return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 }
 
+// The rocket axis is world X, nose towards -X.
 function fromAxis(p: Vec3): number {
-  // The rocket axis is world X.
   return Math.hypot(p[1], p[2]);
 }
 
-function along(direction: Vec3, sign: number, list: WorldFace[], radius: number): WorldFace {
+// The face of the given radius whose normal points along +X (sign 1) or -X (sign -1).
+function faceFacing(list: WorldFace[], radius: number, sign: number): WorldFace {
   for (let i = 0; i < list.length; i++) {
     const face = list[i];
     const r = face.radius === null ? -1 : face.radius;
-    if (Math.abs(r - radius) < 0.05 && face.normal[0] * direction[0] * sign > 0.99) {
+    if (Math.abs(r - radius) < 0.05 && face.normal[0] * sign > 0.99) {
       return face;
     }
   }
   throw new Error('no face of radius ' + String(radius) + ' facing ' + String(sign));
 }
 
-const X: Vec3 = [1, 0, 0];
+function faceOfRadius(list: WorldFace[], radius: number): WorldFace {
+  for (let i = 0; i < list.length; i++) {
+    const r = list[i].radius === null ? -1 : list[i].radius!;
+    if (Math.abs(r - radius) < 0.05) {
+      return list[i];
+    }
+  }
+  throw new Error('no face of radius ' + String(radius));
+}
+
+// Bring the held part's attach face of `ownRadius` onto the screen point of
+// `target`, the way a user would: look where the node is and move the mouse
+// by the difference.
+async function bringHeldNodeTo(page: Page, ownRadius: number, target: Vec3): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const own = faceOfRadius(await heldFaces(page), ownRadius);
+    const ownScreen = await screenOf(page, own.centre);
+    const targetScreen = await screenOf(page, target);
+    const dx = targetScreen.x - ownScreen.x;
+    const dy = targetScreen.y - ownScreen.y;
+    if (Math.hypot(dx, dy) < 3) {
+      return;
+    }
+    if ((await heldSnap(page)) === 'stack') {
+      return;
+    }
+    await glide(page, mouseAt.x + dx, mouseAt.y + dy, 15);
+  }
+}
 
 async function main(): Promise<void> {
   const server = await preview({ preview: { port: 4179, strictPort: true }, logLevel: 'warn' });
@@ -133,6 +192,11 @@ async function main(): Promise<void> {
   });
 
   try {
+    console.log('0. the empty window');
+    await page.goto('http://localhost:4179/');
+    await page.waitForTimeout(400);
+    await shot(page, 'empty');
+
     console.log('1. load parts');
     await page.goto('http://localhost:4179/?parts=nose,tube,can,boattail,fin,sled');
     await page.waitForFunction(function hasHook() {
@@ -154,7 +218,7 @@ async function main(): Promise<void> {
       throw new Error('no canvas');
     }
     const middle = { x: canvas.x + canvas.width * 0.55, y: canvas.y + canvas.height * 0.5 };
-    const emptySpot = { x: canvas.x + canvas.width * 0.5, y: canvas.y + canvas.height * 0.17 };
+    const emptySpot = { x: canvas.x + canvas.width * 0.5, y: canvas.y + canvas.height * 0.15 };
 
     console.log('2. drop the tube as root');
     await clickSelector(page, '.bin-item[data-part-name="tube"]');
@@ -164,134 +228,139 @@ async function main(): Promise<void> {
     let doc = await documentOf(page);
     const tube = one(doc, names, 'tube');
     check(doc.rootId === tube.id, 'the tube is the root');
+    let tubeFaces = await faces(page, tube.id);
+    check(fromAxis(tubeFaces[0].centre) < 0.01 && fromAxis(tubeFaces[1].centre) < 0.01, 'the tube lies on the rocket axis');
     await shot(page, 'tube-root');
 
-    console.log('3. place on face: stand the tube on its other end');
+    console.log('3. place on face: turn the tube end for end');
     await clickSelector(page, 'button[data-tool="face"]');
-    let tubeFaces = await faces(page, tube.id);
-    let tubeCentre = tubeFaces[0].centre;
-    let at = await screenOf(page, [(tubeFaces[0].centre[0] + tubeFaces[1].centre[0]) / 2, 0, 33]);
+    const tubeMiddle: Vec3 = [(tubeFaces[0].centre[0] + tubeFaces[1].centre[0]) / 2, 0, body.outerRadius];
+    let at = await screenOf(page, tubeMiddle);
     await click(page, at.x, at.y); // select the tube
     await clickSelector(page, 'button[data-view="nose"]');
-    await page.waitForTimeout(150);
+    await page.waitForTimeout(100);
     await shot(page, 'tube-faces-from-nose');
-    // The tube end facing the nose view.
-    const foreEnd = along(X, -1, tubeFaces, 33);
-    at = await screenOf(page, foreEnd.centre);
+    // The tube end facing the viewer (the nose end) is clicked; it becomes the aft end.
+    const wasFore = faceFacing(tubeFaces, body.outerRadius, -1);
+    at = await screenOf(page, [wasFore.centre[0], wasFore.centre[1] + 20, wasFore.centre[2]]);
     await click(page, at.x, at.y);
     doc = await documentOf(page);
     tubeFaces = await faces(page, tube.id);
-    const aftEnd = along(X, 1, tubeFaces, 33);
-    check(distance(aftEnd.centre, [0, 0, 0]) < 0.01, 'the clicked face is now the aft face, at the origin');
+    const nowAft = faceFacing(tubeFaces, body.outerRadius, 1);
+    check(fromAxis(nowAft.centre) < 0.01, 'the clicked face is now the aft face, centred on the axis');
     check(doc.attachFaceByPart[tube.partId] !== undefined, 'the choice is remembered for the tube');
-    void tubeCentre;
-    await clickSelector(page, 'button[data-view="side"]');
-    await clickSelector(page, 'button[data-view="fit"]');
-    await page.waitForTimeout(150);
+    await clickSelector(page, 'button[data-tool="place"]');
+    await fitView(page);
     await shot(page, 'tube-turned');
 
-    console.log('4. attach the nose cone by stack snap');
+    console.log('4. snap the can onto the tube by its internals, then push it 70 mm aft by typing');
+    await clickSelector(page, '.bin-item[data-part-name="can"]');
+    await glide(page, emptySpot.x, emptySpot.y, 15);
+    const tubeFore = faceFacing(tubeFaces, body.outerRadius, -1);
+    const tubeForePoint = await screenOf(page, tubeFore.centre);
+    await glide(page, tubeForePoint.x - 120, emptySpot.y, 15);
+    await bringHeldNodeTo(page, can.ringOuterRadius, tubeFore.centre);
+    check((await heldSnap(page)) === 'stack', 'the held can snaps onto the tube end');
+    await shot(page, 'can-snapped');
+    await page.mouse.down();
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    doc = await documentOf(page);
+    const canPlaced = one(doc, names, 'can');
+    check(canPlaced.parentId === tube.id, 'the can is a child of the tube');
+    await clickSelector(page, 'button[data-tool="move"]');
+    const xField = page.locator('.inspector input').first();
+    const xBox = await xField.boundingBox();
+    if (xBox === null) {
+      throw new Error('no inspector');
+    }
+    await click(page, xBox.x + xBox.width - 4, xBox.y + xBox.height / 2);
+    await page.keyboard.press('End');
+    await page.keyboard.type('+70', { delay: 30 });
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(100);
+    let canFaces = await faces(page, canPlaced.id);
+    const canTip = faceOfRadius(canFaces, can.ringOuterRadius);
+    check(Math.abs(canTip.centre[0] - (tubeFore.centre[0] + 70)) < 1e-6, 'the can moved 70 mm aft: its internals are inside the tube');
+    // The can's rim (local z = 0) now meets the tube's fore end.
+    const spigotEnd = faceOfRadius(canFaces, can.spigotCoreRadius);
+    const canRimStation = spigotEnd.centre[0] + can.shellHeight + can.spigotLength;
+    check(Math.abs(canRimStation - tubeFore.centre[0]) < 0.01, 'the can rim meets the tube end');
+    await fitView(page);
+    await shot(page, 'can-pushed-in');
+
+    console.log('5. snap the nose onto the can spigot, then drag it 12 mm aft with the move gizmo');
     await clickSelector(page, 'button[data-tool="place"]');
     await clickSelector(page, '.bin-item[data-part-name="nose"]');
-    await glide(page, emptySpot.x, emptySpot.y, 10);
-    tubeFaces = await faces(page, tube.id);
-    const tubeFore = along(X, -1, tubeFaces, 33);
-    const forePoint = await screenOf(page, tubeFore.centre);
-    // Come in from up and to the left, stopping on the node.
-    await glide(page, forePoint.x - 60, forePoint.y - 80, 15);
-    await glide(page, forePoint.x - 4, forePoint.y - 3, 15);
-    const snapKind = await page.evaluate(function snap() {
-      return window.dc6.heldSnap();
-    });
-    check(snapKind === 'stack', 'the held nose snaps onto the tube end (' + String(snapKind) + ')');
+    await glide(page, emptySpot.x, emptySpot.y, 15);
+    const spigotPoint = await screenOf(page, spigotEnd.centre);
+    await glide(page, spigotPoint.x - 150, emptySpot.y, 15);
+    await bringHeldNodeTo(page, body.outerRadius, spigotEnd.centre);
+    check((await heldSnap(page)) === 'stack', 'the held nose snaps onto the can spigot');
     await shot(page, 'nose-snapped');
     await page.mouse.down();
     await page.mouse.up();
-    await page.waitForTimeout(150);
+    await page.waitForTimeout(100);
     doc = await documentOf(page);
-    const nose = one(doc, names, 'nose');
-    check(nose.parentId === tube.id, 'the nose is a child of the tube');
-    await shot(page, 'nose-dropped');
-
-    console.log('5. join the can with place on face');
-    await clickSelector(page, '.bin-item[data-part-name="can"]');
-    await glide(page, emptySpot.x, emptySpot.y, 15);
-    await click(page, emptySpot.x, emptySpot.y);
-    doc = await documentOf(page);
-    const can = one(doc, names, 'can');
-    check(can.parentId === null, 'the can was dropped free, beside the rocket');
-    await clickSelector(page, 'button[data-tool="face"]');
-    let canFaces = await faces(page, can.id);
-    at = await screenOf(page, canFaces[0].centre);
-    // Select the can by clicking its body (a little off the face centre).
-    const canBody = await page.evaluate(function centre(id) {
-      const list = window.dc6.attachFaces(id);
-      const a = list[0].centre;
-      const b = list[1].centre;
-      return window.dc6.screenOf([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2 + 30, (a[2] + b[2]) / 2 + 2]);
-    }, can.id);
-    await click(page, canBody.x, canBody.y);
-    await clickSelector(page, 'button[data-view="nose"]');
-    await page.waitForTimeout(150);
-    canFaces = await faces(page, can.id);
-    // The can's shoulder step: the 33 mm disc facing the same way as the
-    // spigot end (30 mm). Click it outside the spigot's disc.
-    const spigotEnd = canFaces.find(function spigot(f) {
-      return f.radius !== null && Math.abs(f.radius - 30) < 0.05;
+    const nosePlaced = one(doc, names, 'nose');
+    check(nosePlaced.parentId === canPlaced.id, 'the nose is a child of the can');
+    await clickSelector(page, 'button[data-tool="move"]');
+    const pivot = await page.evaluate(function read() {
+      return window.dc6.gizmoPivot();
     });
-    if (spigotEnd === undefined) {
-      throw new Error('no spigot end on the can');
+    const pivotScreen = await screenOf(page, pivot);
+    // Find the axis handle: slide right from the pivot until it lights up.
+    let handle: { x: number; y: number } | null = null;
+    for (let d = 16; d < 240; d = d + 4) {
+      await glide(page, pivotScreen.x + d, pivotScreen.y, 1);
+      const hovered = await page.evaluate(function read() {
+        return window.dc6.gizmoHovered();
+      });
+      if (hovered) {
+        handle = { x: pivotScreen.x + d, y: pivotScreen.y };
+        break;
+      }
     }
-    const step = canFaces.find(function stepFace(f) {
-      const sameWay = f.normal[0] * spigotEnd.normal[0] + f.normal[1] * spigotEnd.normal[1] + f.normal[2] * spigotEnd.normal[2] > 0.99;
-      return f.radius !== null && Math.abs(f.radius - 33) < 0.05 && sameWay;
-    });
-    if (step === undefined) {
-      throw new Error('no shoulder step on the can');
+    if (handle === null) {
+      throw new Error('could not find the move handle');
     }
-    at = await screenOf(page, [step.centre[0], step.centre[1] + 31.5, step.centre[2]]);
-    await shot(page, 'can-faces');
-    await click(page, at.x, at.y);
-    await clickSelector(page, 'button[data-view="tail"]');
-    await page.waitForTimeout(150);
-    await shot(page, 'can-face-chosen');
-    tubeFaces = await faces(page, tube.id);
-    const tubeAft = along(X, 1, tubeFaces, 33);
-    at = await screenOf(page, [tubeAft.centre[0], tubeAft.centre[1] - 32, tubeAft.centre[2]]);
-    await click(page, at.x, at.y);
-    doc = await documentOf(page);
-    const canAfter = one(doc, names, 'can');
-    check(canAfter.parentId === tube.id, 'the can is joined to the tube');
-    await clickSelector(page, 'button[data-view="side"]');
-    await clickSelector(page, 'button[data-view="fit"]');
-    await page.waitForTimeout(150);
-    await shot(page, 'can-joined');
+    const mmPerPixel = await page.evaluate(function read(p: Vec3) {
+      return window.dc6.millimetresPerPixel(p);
+    }, pivot);
+    await page.mouse.down();
+    await glide(page, handle.x + 12 / mmPerPixel, handle.y, 25);
+    const label = await page.locator('.gizmo-label').textContent();
+    check(label === '+12 mm', 'the drag label reads +12 mm (' + String(label) + ')');
+    await shot(page, 'nose-dragging');
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    const noseFaces = await faces(page, nosePlaced.id);
+    const noseBase = faceOfRadius(noseFaces, body.outerRadius);
+    canFaces = await faces(page, canPlaced.id);
+    const shoulderStation = faceOfRadius(canFaces, can.spigotCoreRadius).centre[0] + can.spigotLength;
+    check(Math.abs(noseBase.centre[0] - shoulderStation) < 0.01, 'the nose rim lands on the can shoulder (off by ' + (noseBase.centre[0] - shoulderStation).toExponential(2) + ' mm)');
+    check(Math.abs((noseBase.radius ?? 0) - can.endRadius) < 0.01 && fromAxis(noseBase.centre) < 0.01, 'nose and can are flush at the joint: both 33 mm, coaxial');
+    await fitView(page);
+    await shot(page, 'nose-on-can');
 
-    console.log('6. attach the boattail by stack snap');
+    console.log('6. snap the boattail onto the tube');
     await clickSelector(page, 'button[data-tool="place"]');
     await clickSelector(page, '.bin-item[data-part-name="boattail"]');
-    await glide(page, emptySpot.x, emptySpot.y, 10);
-    canFaces = await faces(page, can.id);
-    const rim = canFaces.find(function rimFace(f) {
-      return f.radius !== null && Math.abs(f.radius - 33) < 0.05 && f.normal[0] > 0.99;
-    });
-    if (rim === undefined) {
-      throw new Error('no free rim on the can');
-    }
-    const rimPoint = await screenOf(page, rim.centre);
-    await glide(page, rimPoint.x + 70, rimPoint.y - 60, 15);
-    await glide(page, rimPoint.x + 3, rimPoint.y + 2, 15);
-    const tailSnap = await page.evaluate(function snap() {
-      return window.dc6.heldSnap();
-    });
-    check(tailSnap === 'stack', 'the held boattail snaps onto the can rim (' + String(tailSnap) + ')');
+    await glide(page, emptySpot.x, emptySpot.y, 15);
+    tubeFaces = await faces(page, tube.id);
+    const tubeAft = faceFacing(tubeFaces, body.outerRadius, 1);
+    const tubeAftPoint = await screenOf(page, tubeAft.centre);
+    await glide(page, tubeAftPoint.x + 120, emptySpot.y, 15);
+    await bringHeldNodeTo(page, body.outerRadius, tubeAft.centre);
+    check((await heldSnap(page)) === 'stack', 'the held boattail snaps onto the tube aft end');
     await shot(page, 'boattail-snapped');
     await page.mouse.down();
     await page.mouse.up();
-    await page.waitForTimeout(150);
+    await page.waitForTimeout(100);
     doc = await documentOf(page);
     const boattail = one(doc, names, 'boattail');
-    check(boattail.parentId === can.id, 'the boattail is a child of the can');
+    check(boattail.parentId === tube.id, 'the boattail is a child of the tube');
+    await fitView(page);
     await shot(page, 'boattail-dropped');
 
     console.log('7. one fin with x4 symmetry');
@@ -301,18 +370,16 @@ async function main(): Promise<void> {
     const symmetryText = await page.locator('button[data-control="symmetry"]').textContent();
     check(symmetryText === '×4', 'symmetry set to x4');
     await clickSelector(page, '.bin-item[data-part-name="fin"]');
-    await glide(page, emptySpot.x, emptySpot.y, 10);
-    // On the near side of the tube, 30 mm forward of its aft end.
-    const finPoint = await screenOf(page, [-30, 0, 33]);
+    await glide(page, emptySpot.x, emptySpot.y, 15);
+    // On the tube, 60 mm forward of its aft end, a little above the side facing us.
+    const angle = (30 * Math.PI) / 180;
+    const finPoint = await screenOf(page, [tubeAft.centre[0] - 60, body.outerRadius * Math.sin(angle), body.outerRadius * Math.cos(angle)]);
     await glide(page, finPoint.x, finPoint.y, 20);
-    const finSnap = await page.evaluate(function snap() {
-      return window.dc6.heldSnap();
-    });
-    check(finSnap === 'surface', 'the held fin attaches to the tube surface (' + String(finSnap) + ')');
+    check((await heldSnap(page)) === 'surface', 'the held fin stands on the tube surface');
     await shot(page, 'fin-held');
     await page.mouse.down();
     await page.mouse.up();
-    await page.waitForTimeout(150);
+    await page.waitForTimeout(100);
     await shot(page, 'fins-dropped');
 
     console.log('8. hide the sled');
@@ -321,70 +388,78 @@ async function main(): Promise<void> {
     await click(page, emptySpot.x, emptySpot.y);
     doc = await documentOf(page);
     const sled = one(doc, names, 'sled');
+    await shot(page, 'sled-dropped');
     await clickSelector(page, '.tree-row[data-placed-id="' + sled.id + '"] .eye');
     doc = await documentOf(page);
     check(one(doc, names, 'sled').hidden, 'the sled is hidden');
     await shot(page, 'sled-hidden');
 
     console.log('9. undo twice, redo once');
-    await page.mouse.move(middle.x, canvas.y + canvas.height - 40);
+    await glide(page, middle.x, canvas.y + canvas.height - 40, 5);
     await page.keyboard.press('Control+z');
-    await page.waitForTimeout(100);
+    await page.waitForTimeout(80);
     doc = await documentOf(page);
     check(!one(doc, names, 'sled').hidden, 'first undo shows the sled again');
     await page.keyboard.press('Control+z');
-    await page.waitForTimeout(100);
+    await page.waitForTimeout(80);
     doc = await documentOf(page);
     check(placedOfPart(doc, names, 'sled').length === 0, 'second undo removes the sled');
     await page.keyboard.press('Control+Shift+z');
-    await page.waitForTimeout(100);
+    await page.waitForTimeout(80);
     doc = await documentOf(page);
     check(placedOfPart(doc, names, 'sled').length === 1, 'redo puts the sled back');
     const assemblyMs = Date.now() - assemblyStart;
-    await clickSelector(page, 'button[data-view="fit"]');
-    await page.mouse.move(canvas.x + 5, canvas.y + canvas.height - 5);
-    await page.waitForTimeout(200);
+    await page.keyboard.press('Escape');
+    await fitView(page);
+    await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 3);
+    await page.waitForTimeout(150);
     await shot(page, 'final');
+    await clickSelector(page, 'button[data-view="tail"]');
+    await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 3);
+    await page.waitForTimeout(150);
+    await shot(page, 'final-from-tail');
 
     console.log('10. check the assembly');
     doc = await documentOf(page);
-    const sections = ['tube', 'nose', 'can', 'boattail'];
+    const sections = ['nose', 'can', 'tube', 'boattail'];
+    const stations: number[] = [];
     for (let i = 0; i < sections.length; i++) {
       const placed = one(doc, names, sections[i]);
       const list = await faces(page, placed.id);
       let worst = 0;
       let worstAngle = 0;
+      let sum = 0;
       for (let k = 0; k < list.length; k++) {
-        if (list[k].radius === null) {
-          continue;
-        }
         worst = Math.max(worst, fromAxis(list[k].centre));
         worstAngle = Math.max(worstAngle, 1 - Math.abs(list[k].normal[0]));
+        sum = sum + list[k].centre[0];
       }
+      stations.push(sum / list.length);
       check(worst < 0.01 && worstAngle < 1e-9, sections[i] + ' is coaxial with the rocket axis (off by ' + worst.toExponential(2) + ' mm)');
     }
-    for (let i = 0; i < doc.placed.length; i++) {
-      const child = doc.placed[i];
-      if (child.parentId === null || child.joint === null || child.joint.parentFace === null) {
-        continue;
-      }
-      const own = (await faces(page, child.id))[child.joint.ownFace];
-      const theirs = (await faces(page, child.parentId))[child.joint.parentFace];
-      const gap = distance(own.centre, theirs.centre);
-      const facing = own.normal[0] * theirs.normal[0] + own.normal[1] * theirs.normal[1] + own.normal[2] * theirs.normal[2];
-      check(gap < 0.01 && facing < -1 + 1e-9, names[child.partId] + ' touches its parent face to face (gap ' + gap.toExponential(2) + ' mm)');
-    }
+    check(stations[0] < stations[1] && stations[1] < stations[2] && stations[2] < stations[3], 'nose, can, tube, boattail run left to right (nose left)');
+    const boattailFaces = await faces(page, boattail.id);
+    const boattailFore = faceFacing(boattailFaces, body.outerRadius, -1);
+    const gap = distance(boattailFore.centre, tubeAft.centre);
+    check(gap < 0.01, 'the boattail touches the tube face to face (gap ' + gap.toExponential(2) + ' mm)');
     const fins = placedOfPart(doc, names, 'fin');
     check(fins.length === 4, 'four fins');
-    const groups = new Set(fins.map(function group(f) {
-      return f.symmetry === null ? 'none' : f.symmetry.group;
-    }));
+    const groups = new Set(
+      fins.map(function group(f) {
+        return f.symmetry === null ? 'none' : f.symmetry.group;
+      }),
+    );
     check(groups.size === 1 && !groups.has('none'), 'the four fins are one linked symmetry set');
     const angles: number[] = [];
     for (let i = 0; i < fins.length; i++) {
       const list = await faces(page, fins[i].id);
-      const root = list[fins[i].joint === null ? 0 : fins[i].joint.ownFace];
-      check(Math.abs(fromAxis(root.centre) - 33) < 0.05, 'fin ' + String(i + 1) + ' root sits on the tube surface (r = ' + fromAxis(root.centre).toFixed(3) + ' mm)');
+      const ownFace = fins[i].joint === null ? 0 : fins[i].joint!.ownFace;
+      const root = list[ownFace];
+      check(Math.abs(fromAxis(root.centre) - body.outerRadius) < 0.05, 'fin ' + String(i + 1) + ' root sits on the tube (r = ' + fromAxis(root.centre).toFixed(3) + ' mm)');
+      // Square to the tube: the root face looks straight in at the axis.
+      const radialLength = fromAxis(root.centre);
+      const inward = (root.normal[1] * root.centre[1] + root.normal[2] * root.centre[2]) / radialLength;
+      check(inward < -1 + 1e-6, 'fin ' + String(i + 1) + ' stands square to the tube');
       angles.push(Math.atan2(root.centre[2], root.centre[1]));
     }
     angles.sort(function ascending(a, b) {
@@ -393,7 +468,7 @@ async function main(): Promise<void> {
     for (let i = 0; i < angles.length; i++) {
       const next = i + 1 < angles.length ? angles[i + 1] : angles[0] + 2 * Math.PI;
       const spacing = ((next - angles[i]) * 180) / Math.PI;
-      check(Math.abs(spacing - 90) < 1e-6, 'fins ' + String(i + 1) + ' and ' + String(((i + 1) % 4) + 1) + ' are 90 degrees apart (' + spacing.toFixed(6) + ')');
+      check(Math.abs(spacing - 90) < 1e-6, 'neighbouring fins are 90 degrees apart (' + spacing.toFixed(6) + ')');
     }
     const frameTimes = await page.evaluate(function times() {
       return window.dc6.frameTimes();
@@ -414,6 +489,7 @@ async function main(): Promise<void> {
       });
     });
   }
+  console.log('whole run took ' + ((Date.now() - runStart) / 1000).toFixed(1) + ' s');
   if (failures.length > 0) {
     console.log(String(failures.length) + ' check(s) failed');
     process.exit(1);
