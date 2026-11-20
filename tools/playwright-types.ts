@@ -14,17 +14,31 @@ export interface Mouse {
   move(x: number, y: number, options?: { steps?: number }): Promise<void>;
   down(options?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
   up(options?: { button?: 'left' | 'right' | 'middle' }): Promise<void>;
+  dblclick(x: number, y: number): Promise<void>;
+  wheel(deltaX: number, deltaY: number): Promise<void>;
 }
 
 export interface Keyboard {
   press(key: string): Promise<void>;
   type(text: string, options?: { delay?: number }): Promise<void>;
+  down(key: string): Promise<void>;
+  up(key: string): Promise<void>;
 }
 
 export interface Locator {
   first(): Locator;
   boundingBox(): Promise<Box | null>;
   textContent(): Promise<string | null>;
+  count(): Promise<number>;
+  setInputFiles(files: string[]): Promise<void>;
+  isVisible(): Promise<boolean>;
+  inputValue(): Promise<string>;
+  scrollIntoViewIfNeeded(): Promise<void>;
+}
+
+export interface Download {
+  suggestedFilename(): string;
+  path(): Promise<string>;
 }
 
 export interface Page {
@@ -36,6 +50,7 @@ export interface Page {
   evaluate<R, A>(callback: (argument: A) => R | Promise<R>, argument: A): Promise<R>;
   locator(selector: string): Locator;
   on(event: 'pageerror', listener: (error: Error) => void): void;
+  waitForEvent(event: 'download'): Promise<Download>;
   mouse: Mouse;
   keyboard: Keyboard;
 }

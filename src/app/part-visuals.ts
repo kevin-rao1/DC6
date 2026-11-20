@@ -64,6 +64,15 @@ export class PartVisual {
     this.group.add(mesh);
   }
 
+  // The preview base colour ('#rrggbb'), or null for the plain part grey.
+  setColour(colour: string | null): void {
+    if (colour === null) {
+      this.material.color.setHex(partColour);
+    } else {
+      this.material.color.set(colour);
+    }
+  }
+
   setHighlight(highlight: Highlight): void {
     if (highlight === this.highlight) {
       return;

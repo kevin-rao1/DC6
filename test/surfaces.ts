@@ -39,6 +39,89 @@ export function surfaceOf(list: Placed[]): Surface {
   return { pieces: pieces };
 }
 
+// An independent intrinsic measure of a developable mesh: lay its triangles
+// out flat by unfolding outward from one triangle (breadth first, each new
+// triangle placed against an edge already laid down, keeping its edge
+// lengths). Within `reach` mm of the start. Returns per-triangle 2D corner
+// positions. On a developable tessellation (plane, polyhedral cylinder or
+// cone) this is exact, so distances in it are distances in the surface.
+export function unfoldMesh(mesh: SurfaceMesh, start: number, reach: number): Map<number, [number, number][]> {
+  const layout = new Map<number, [number, number][]>();
+  const corner = function corner(t: number, k: number): Vec3 {
+    const v = 3 * mesh.triangles[3 * t + k];
+    return [mesh.positions[v], mesh.positions[v + 1], mesh.positions[v + 2]];
+  };
+  const a0 = corner(start, 0);
+  const b0 = corner(start, 1);
+  const c0 = corner(start, 2);
+  const ab = Math.hypot(b0[0] - a0[0], b0[1] - a0[1], b0[2] - a0[2]);
+  const ac = Math.hypot(c0[0] - a0[0], c0[1] - a0[1], c0[2] - a0[2]);
+  const bc = Math.hypot(c0[0] - b0[0], c0[1] - b0[1], c0[2] - b0[2]);
+  const cx = (ab * ab + ac * ac - bc * bc) / (2 * ab);
+  const cy = Math.sqrt(Math.max(0, ac * ac - cx * cx));
+  layout.set(start, [
+    [0, 0],
+    [ab, 0],
+    [cx, cy],
+  ]);
+  const queue = [start];
+  while (queue.length > 0) {
+    const t = queue.shift() as number;
+    const flat = layout.get(t) as [number, number][];
+    for (let e = 0; e < 3; e++) {
+      const n = mesh.neighbours[3 * t + e];
+      if (n < 0 || layout.has(n)) {
+        continue;
+      }
+      const centre = corner(n, 0);
+      if (Math.hypot(centre[0] - a0[0], centre[1] - a0[1], centre[2] - a0[2]) > reach) {
+        continue;
+      }
+      const p = mesh.triangles[3 * t + e];
+      const q = mesh.triangles[3 * t + ((e + 1) % 3)];
+      // Corners of n: which are p and q, which is new.
+      const placed: [number, number][] = [
+        [0, 0],
+        [0, 0],
+        [0, 0],
+      ];
+      let fresh = -1;
+      for (let k = 0; k < 3; k++) {
+        const v = mesh.triangles[3 * n + k];
+        if (v === p) {
+          placed[k] = flat[e];
+        } else if (v === q) {
+          placed[k] = flat[(e + 1) % 3];
+        } else {
+          fresh = k;
+        }
+      }
+      const kp = (fresh + 1) % 3;
+      const kq = (fresh + 2) % 3;
+      const P = placed[kp];
+      const Q = placed[kq];
+      const p3 = corner(n, kp);
+      const q3 = corner(n, kq);
+      const r3 = corner(n, fresh);
+      const pq = Math.hypot(q3[0] - p3[0], q3[1] - p3[1], q3[2] - p3[2]);
+      const pr = Math.hypot(r3[0] - p3[0], r3[1] - p3[1], r3[2] - p3[2]);
+      const qr = Math.hypot(r3[0] - q3[0], r3[1] - q3[1], r3[2] - q3[2]);
+      const along = (pq * pq + pr * pr - qr * qr) / (2 * pq);
+      const across = Math.sqrt(Math.max(0, pr * pr - along * along));
+      const ux = (Q[0] - P[0]) / pq;
+      const uy = (Q[1] - P[1]) / pq;
+      // The new corner goes on the far side of PQ from t's third corner.
+      const third = flat[(e + 2) % 3];
+      const side = ux * (third[1] - P[1]) - uy * (third[0] - P[0]);
+      const sign = side > 0 ? -1 : 1;
+      placed[fresh] = [P[0] + ux * along - uy * across * sign, P[1] + uy * along + ux * across * sign];
+      layout.set(n, placed);
+      queue.push(n);
+    }
+  }
+  return layout;
+}
+
 // The attach face of a part with a circular outline of this radius.
 export function circularFace(part: Part, radius: number, after: number): number {
   for (let f = 0; f < part.attachFaces.length; f++) {

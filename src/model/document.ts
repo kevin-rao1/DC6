@@ -9,6 +9,7 @@
 import type { RigidTransform } from '../geometry/transform.ts';
 import { cloneTransform, compose, invert } from '../geometry/transform.ts';
 import { aboutAxis } from '../geometry/mating.ts';
+import type { Decal } from './decals.ts';
 
 export interface Joint {
   // Attach face of this part that is joined (index into Part.attachFaces).
@@ -46,10 +47,17 @@ export interface AssemblyDocument {
   attachFaceByPart: Record<string, number>;
   // Counter for new ids, so ids are never reused (undo depends on that).
   nextId: number;
+  // Decals, bottom layer first (see decals.ts).
+  decals: Decal[];
+  // Vinyl colours the user added to the two presets.
+  vinylColours: string[];
+  // Preview colour of placed parts (placed id -> '#rrggbb'); unlisted parts
+  // are shown in the plain part grey.
+  partColours: Record<string, string>;
 }
 
 export function emptyDocument(): AssemblyDocument {
-  return { placed: [], rootId: null, attachFaceByPart: {}, nextId: 1 };
+  return { placed: [], rootId: null, attachFaceByPart: {}, nextId: 1, decals: [], vinylColours: [], partColours: {} };
 }
 
 export function cloneDocument(doc: AssemblyDocument): AssemblyDocument {
@@ -166,7 +174,7 @@ export function movePart(doc: AssemblyDocument, id: string, transform: RigidTran
   return next;
 }
 
-// Remove parts and everything below them.
+// Remove parts and everything below them, and the decals stuck on them.
 export function removeParts(doc: AssemblyDocument, ids: string[]): AssemblyDocument {
   const next = cloneDocument(doc);
   const doomed = new Set<string>();
@@ -183,6 +191,13 @@ export function removeParts(doc: AssemblyDocument, ids: string[]): AssemblyDocum
     }
   }
   next.placed = kept;
+  const keptDecals: Decal[] = [];
+  for (let i = 0; i < next.decals.length; i++) {
+    if (!doomed.has(next.decals[i].anchor.placedId)) {
+      keptDecals.push(next.decals[i]);
+    }
+  }
+  next.decals = keptDecals;
   if (next.rootId !== null && doomed.has(next.rootId)) {
     next.rootId = null;
   }

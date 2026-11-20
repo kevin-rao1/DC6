@@ -47,6 +47,8 @@ import type { StackPair } from './stack-snap.ts';
 import { findStackPair, freeFaces } from './stack-snap.ts';
 import { faceOnFace, faceOnSurface, rootOnFace } from './place-on-face.ts';
 import { PartGizmo } from './gizmo.ts';
+import { DecalTool } from './decal-tool.ts';
+import type { Decal } from '../model/decals.ts';
 
 export type Tool = 'place' | 'move' | 'rotate' | 'face';
 
@@ -84,6 +86,8 @@ interface Press {
   button: number;
   onPart: string | null;
   moved: boolean;
+  // The press went to the decal tool.
+  decal: boolean;
 }
 
 // The direction "sideways" completes the rocket frame: along the rocket
@@ -113,7 +117,12 @@ export type LastOperation =
       pivot: Vec3;
       axis: 'along' | 'up' | 'side';
       degrees: number;
-    };
+    }
+  // Decal operations: how far the decal moved along and around the rocket
+  // (mm on the surface), its angle from upright, its new size.
+  | { kind: 'decal-move'; decalId: string; before: AssemblyDocument; start: Decal; along: number; around: number }
+  | { kind: 'decal-rotate'; decalId: string; before: AssemblyDocument; start: Decal; degrees: number }
+  | { kind: 'decal-scale'; decalId: string; before: AssemblyDocument; start: Decal; width: number; height: number };
 
 export interface EditorEvents {
   // Something the panels show has changed.
@@ -144,6 +153,9 @@ export class Editor {
   private readonly activeMarker = new Markers(17, true, accent);
 
   readonly gizmo: PartGizmo;
+  readonly decals: DecalTool;
+  // Shift is down (free rotation and roll angle, finer steps).
+  private shiftDown = false;
   lastOperation: LastOperation | null = null;
   // The committed pose of the selected part when a gizmo drag began.
   private gizmoStartPose: RigidTransform | null = null;
@@ -170,6 +182,8 @@ export class Editor {
         self.gizmoCommit(motion);
       },
     });
+
+    this.decals = new DecalTool(this, container);
 
     const canvas = this.view.canvas;
     // Capture phase: these run before the orbit controls' own listeners, so
@@ -215,7 +229,7 @@ export class Editor {
     this.listeners.push(listener);
   }
 
-  private notify(): void {
+  notify(): void {
     for (let i = 0; i < this.listeners.length; i++) {
       this.listeners[i].changed();
     }
@@ -278,7 +292,46 @@ export class Editor {
   // last operation's panel.
   private commit(next: AssemblyDocument): void {
     this.lastOperation = null;
+    this.decals.refreshAnchors(next);
     this.history.commit(next);
+    this.showCommitted();
+  }
+
+  // For the decal tool: commit an edit (one undo step), with the operation
+  // the adjust panel offers for it, if any.
+  commitDocument(next: AssemblyDocument, operation: LastOperation | null): void {
+    this.commit(next);
+    this.lastOperation = operation;
+    this.notify();
+  }
+
+  // Show a document without committing it (a decal being dragged).
+  previewDocument(doc: AssemblyDocument): void {
+    this.shown = doc;
+    this.syncScene();
+    this.notify();
+  }
+
+  // Redraw from the committed document (after a cancelled drag, a new selection).
+  redraw(): void {
+    this.showCommitted();
+  }
+
+  // Select a placed part without touching the decal selection logic.
+  selectPartOnly(placedId: string | null): void {
+    this.selectedId = placedId;
+    this.chosenFace = null;
+  }
+
+  // A decal was picked up from the list or duplicated: nothing else is held
+  // or selected.
+  decalHoldStarted(): void {
+    this.lastOperation = null;
+    if (this.held !== null) {
+      this.held = null;
+    }
+    this.selectedId = null;
+    this.chosenFace = null;
     this.showCommitted();
   }
 
@@ -295,6 +348,7 @@ export class Editor {
   undo(): void {
     this.lastOperation = null;
     this.cancelHeld();
+    this.decals.cancel();
     if (this.history.undo()) {
       this.showCommitted();
     }
@@ -303,6 +357,7 @@ export class Editor {
   redo(): void {
     this.lastOperation = null;
     this.cancelHeld();
+    this.decals.cancel();
     if (this.history.redo()) {
       this.showCommitted();
     }
@@ -335,6 +390,8 @@ export class Editor {
         this.view.partsGroup.add(entry.visual.group);
       }
       applyTransform(entry.visual.group, placed.transform);
+      const colour = this.shown.partColours[placed.id];
+      entry.visual.setColour(colour === undefined ? null : colour);
     }
     const self = this;
     this.visuals.forEach(function removeStale(entry, id) {
@@ -348,6 +405,7 @@ export class Editor {
     this.updatePatches();
     this.updateMarkers();
     this.updateGizmo();
+    this.decals.sync(this.shown);
     this.view.requestRender();
   }
 
@@ -462,6 +520,20 @@ export class Editor {
   // with it.
   private offeredFaces(): FaceRef[] {
     const wanted: FaceRef[] = [];
+    if (this.tool === 'face' && this.held === null && this.decals.selectedId !== null) {
+      // A decal is centred on any visible part's face.
+      for (let i = 0; i < this.shown.placed.length; i++) {
+        const other = this.shown.placed[i];
+        if (other.hidden) {
+          continue;
+        }
+        const otherPart = requirePart(this.parts, other.partId);
+        for (let f = 0; f < otherPart.attachFaces.length; f++) {
+          wanted.push({ placedId: other.id, face: f });
+        }
+      }
+      return wanted;
+    }
     if (this.tool !== 'face' || this.held !== null || this.selectedId === null) {
       return wanted;
     }
@@ -514,7 +586,9 @@ export class Editor {
       }
       const onSelected = ref.placedId === this.selectedId;
       const hovered = sameFace(this.hoverFace, ref);
-      if (onSelected && this.chosenFace === ref.face) {
+      if (this.decals.selectedId !== null) {
+        patch.setState(hovered ? 'hover' : 'idle');
+      } else if (onSelected && this.chosenFace === ref.face) {
         patch.setState('chosen');
       } else if (hovered) {
         patch.setState('hover');
@@ -608,6 +682,8 @@ export class Editor {
   pickNew(partId: string): void {
     this.lastOperation = null;
     this.cancelHeld();
+    this.decals.cancelHeld();
+    this.decals.selectedId = null;
     this.chosenFace = null;
     // While a new part is held nothing else is selected (as in KSP).
     this.selectedId = null;
@@ -672,7 +748,10 @@ export class Editor {
     // Once per frame however many pointer events arrive.
     requestAnimationFrame(function update() {
       self.updateQueued = false;
-      if (self.held !== null) {
+      if (self.decals.isBusy()) {
+        self.decals.pointerMove(self.pointerX, self.pointerY, self.shiftDown);
+        self.updateHover();
+      } else if (self.held !== null) {
         self.updateHeld();
       } else {
         self.updateHover();
@@ -743,7 +822,10 @@ export class Editor {
         const target = worldFace(this.parts, requirePlaced(committed, pair.targetId), pair.targetFace);
         pose = mateFaces(part.attachFaces[pair.ownFace], floatingPose, target.centre, target.normal, held.roll);
       } else if (faceIndex >= 0 && this.pointerInside) {
-        const hit = pickPart(committed, this.parts, ray.origin, ray.direction, moving);
+        let hit = pickPart(committed, this.parts, ray.origin, ray.direction, moving);
+        if (hit !== null && !this.shiftDown) {
+          hit = this.snapRoll(hit, moving);
+        }
         if (hit !== null) {
           snap = { kind: 'surface', targetId: hit.placedId, point: hit.point, normal: hit.normal };
           pose = attachToSurface(part.attachFaces[faceIndex], middle, floatingPose, hit.point, hit.normal, held.roll);
@@ -759,6 +841,36 @@ export class Editor {
     held.shownIds = preview.movingIds;
     this.view.canvas.style.cursor = 'grabbing';
     this.syncScene();
+  }
+
+  // KSP's angle snap for parts on the side of another: the roll angle about
+  // the rocket axis goes to the nearest 15 degrees from straight up. The
+  // point is found again by casting a ray at the axis from that angle, at
+  // the same station, so it lands on the surface whatever its shape. If that
+  // ray finds nothing on the same part, the unsnapped point stands.
+  private snapRoll(hit: PartHit, moving: Set<string>): PartHit {
+    const relative = sub(hit.point, AXIS_ORIGIN);
+    const station = dot(relative, AFT_DIRECTION);
+    const radial = sub(relative, scale(AFT_DIRECTION, station));
+    const radius = Math.hypot(radial[0], radial[1], radial[2]);
+    if (radius < 1e-6) {
+      return hit;
+    }
+    // Angle from straight up, turning about the aft direction.
+    const side = cross(AFT_DIRECTION, WORLD_UP);
+    const angle = Math.atan2(dot(radial, side), dot(radial, WORLD_UP));
+    const step = (15 * Math.PI) / 180;
+    const snapped = Math.round(angle / step) * step;
+    const outward = add(scale(WORLD_UP, Math.cos(snapped)), scale(side, Math.sin(snapped)));
+    const axisPoint = add(AXIS_ORIGIN, scale(AFT_DIRECTION, station));
+    const far = radius + 1000;
+    const origin = add(axisPoint, scale(outward, far));
+    const inward = scale(outward, -1);
+    const again = pickPart(this.history.document, this.parts, origin, inward, moving);
+    if (again === null || again.placedId !== hit.placedId) {
+      return hit;
+    }
+    return again;
   }
 
   // The document a drop would commit, and the ids that move with the held part.
@@ -852,8 +964,15 @@ export class Editor {
       if (hit !== null) {
         hoverId = hit.placedId;
       }
+      let decalCursor: string | null = null;
+      if (this.tool !== 'face' && !this.gizmo.hovered()) {
+        decalCursor = this.decals.cursorAt(this.pointerX, this.pointerY);
+      }
       if (this.gizmo.hovered()) {
         cursor = this.tool === 'move' ? 'move' : 'grab';
+        hoverId = null;
+      } else if (decalCursor !== null) {
+        cursor = decalCursor;
         hoverId = null;
       } else if (hoverFace !== null) {
         cursor = 'pointer';
@@ -892,12 +1011,21 @@ export class Editor {
     this.pointerInside = true;
     this.setModifiers(event.shiftKey, event.ctrlKey || event.metaKey);
     let onPart: string | null = null;
+    if (event.button === 0 && this.held === null && this.tool !== 'face' && !this.gizmo.hovered()) {
+      // Decals first: they lie on top of the parts.
+      if (this.decals.pointerDown(event.clientX, event.clientY)) {
+        this.view.controls.enabled = false;
+        this.press = { x: event.clientX, y: event.clientY, button: event.button, onPart: null, moved: false, decal: true };
+        this.notify();
+        return;
+      }
+    }
     if (event.button === 0 && this.held === null) {
       // The gizmo handles its own presses.
       if (this.gizmo.hovered()) {
         // The orbit controls must not turn the view while a handle is dragged.
         this.view.controls.enabled = false;
-        this.press = { x: event.clientX, y: event.clientY, button: event.button, onPart: null, moved: true };
+        this.press = { x: event.clientX, y: event.clientY, button: event.button, onPart: null, moved: true, decal: false };
         return;
       }
       const ray = this.view.rayAt(event.clientX, event.clientY);
@@ -920,7 +1048,7 @@ export class Editor {
       // A click drops the held part; it must not start an orbit.
       this.view.controls.enabled = false;
     }
-    this.press = { x: event.clientX, y: event.clientY, button: event.button, onPart: onPart, moved: false };
+    this.press = { x: event.clientX, y: event.clientY, button: event.button, onPart: onPart, moved: false, decal: false };
   }
 
   private onPointerMove(event: PointerEvent): void {
@@ -938,7 +1066,7 @@ export class Editor {
       if (travelled > clickSlop) {
         press.moved = true;
         // Press and drag on a part in place mode: carry it, drop on release.
-        const grabbable = this.tool === 'place' && press.button === 0 && press.onPart !== null && press.onPart !== this.history.document.rootId;
+        const grabbable = this.tool === 'place' && press.button === 0 && !press.decal && press.onPart !== null && press.onPart !== this.history.document.rootId;
         if (grabbable && this.held === null && press.onPart !== null) {
           this.pickUp(press.onPart, true);
         }
@@ -952,6 +1080,17 @@ export class Editor {
     this.press = null;
     this.view.controls.enabled = !this.gizmo.dragging;
     const overCanvas = event.target === this.view.canvas;
+    if (event.button === 0 && (this.decals.isBusy() || (press !== null && press.decal))) {
+      this.pointerX = event.clientX;
+      this.pointerY = event.clientY;
+      // Bring a drag up to the release point before letting go.
+      this.decals.pointerMove(event.clientX, event.clientY, event.shiftKey);
+      if (this.decals.pointerUp(event.clientX, event.clientY, overCanvas)) {
+        this.updateHover();
+        this.notify();
+        return;
+      }
+    }
     if (press === null) {
       // The press began outside the view (a part dragged in from the list).
       if (this.held !== null && overCanvas && event.button === 0) {
@@ -999,6 +1138,7 @@ export class Editor {
 
   select(placedId: string | null): void {
     this.lastOperation = null;
+    this.decals.selectedId = null;
     this.selectedId = placedId;
     this.chosenFace = null;
     this.syncScene();
@@ -1008,6 +1148,10 @@ export class Editor {
   // Escape or right click: put what is held back where it came from, or
   // forget the chosen face, or clear the selection.
   private cancel(): void {
+    if (this.decals.cancel()) {
+      this.notify();
+      return;
+    }
     if (this.held !== null) {
       this.cancelHeld();
     } else if (this.chosenFace !== null) {
@@ -1026,6 +1170,26 @@ export class Editor {
     const ray = this.view.rayAt(clientX, clientY);
     const doc = this.history.document;
     const faceUnder = pickFace(this.shown, this.parts, ray.origin, ray.direction, this.offeredFaces());
+    if (this.decals.selectedId !== null) {
+      // Place on face for a decal: one click, the decal is centred there.
+      if (faceUnder !== null) {
+        this.decals.centreOnFace(faceUnder.placedId, faceUnder.face);
+      } else {
+        const decalHit = this.decals.decalUnder(clientX, clientY);
+        if (decalHit !== null) {
+          this.decals.select(decalHit.id);
+        } else {
+          this.select(onPart);
+        }
+      }
+      return;
+    }
+    const decalHit = this.decals.decalUnder(clientX, clientY);
+    if (decalHit !== null && this.chosenFace === null) {
+      this.decals.select(decalHit.id);
+      this.notify();
+      return;
+    }
     let selected = null;
     if (this.selectedId !== null) {
       selected = findPlaced(doc, this.selectedId);
@@ -1103,9 +1267,18 @@ export class Editor {
   // Re-do the last operation with exact values typed by the user: for a
   // move [along, up, side] in mm, for a rotate [degrees]. It replaces the
   // operation (one undo step), it does not add to it.
-  adjustLastOperation(values: number[]): void {
+  adjustLastOperation(values: number[], axis?: 'along' | 'up' | 'side'): void {
     const operation = this.lastOperation;
     if (operation === null) {
+      return;
+    }
+    if (operation.kind === 'decal-move' || operation.kind === 'decal-rotate' || operation.kind === 'decal-scale') {
+      const next = this.decals.adjust(operation, values);
+      if (next !== null) {
+        this.decals.refreshAnchors(next);
+        this.history.replace(next);
+        this.showCommitted();
+      }
       return;
     }
     let motion: RigidTransform;
@@ -1125,8 +1298,12 @@ export class Editor {
         throw new Error('adjustLastOperation: a rotate takes 1 value, got ' + String(values.length));
       }
       operation.degrees = values[0];
-      const axis = rocketDirection(operation.axis);
-      motion = rotationAboutLine(operation.pivot, axis, (values[0] * Math.PI) / 180);
+      if (axis !== undefined) {
+        // As Blender's panel: the axis can be changed after the fact.
+        operation.axis = axis;
+      }
+      const direction = rocketDirection(operation.axis);
+      motion = rotationAboutLine(operation.pivot, direction, (values[0] * Math.PI) / 180);
     }
     const pose = compose(motion, operation.startPose);
     this.history.replace(movePart(operation.before, operation.placedId, pose));
@@ -1134,6 +1311,7 @@ export class Editor {
   }
 
   private setModifiers(shift: boolean, ctrl: boolean): void {
+    this.shiftDown = shift;
     this.gizmo.setModifiers(shift, ctrl);
     if (!this.gizmo.dragging) {
       this.gizmoStartPose = null;
@@ -1298,6 +1476,13 @@ export class Editor {
       this.redo();
       return;
     }
+    if (command && key === 'd') {
+      // Duplicate the selected decal: the copy follows the cursor.
+      event.preventDefault();
+      this.decals.duplicateSelected();
+      this.notify();
+      return;
+    }
     if (command) {
       return;
     }
@@ -1307,7 +1492,14 @@ export class Editor {
     }
     if (key === 'delete' || key === 'backspace') {
       event.preventDefault();
-      this.deleteSelected();
+      if (!this.decals.deleteSelected()) {
+        this.deleteSelected();
+      }
+      return;
+    }
+    if (this.decals.selectedId !== null && (key === 'h' || key === 'v')) {
+      // Flip horizontally or vertically (Inkscape's keys).
+      this.decals.flipSelected(key === 'h' ? 'x' : 'y');
       return;
     }
     if (key === '1') {

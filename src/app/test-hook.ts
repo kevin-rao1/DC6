@@ -36,6 +36,23 @@ export interface TestHook {
   // Millimetres per CSS pixel at a world point.
   millimetresPerPixel(point: Vec3): number;
   frameTimes(): number[];
+  // Decals: the selected one, where one lies (world), its handles on screen,
+  // and how long re-mapping took while dragging (ms each).
+  selectedDecal(): string | null;
+  decalInfo(id: string): DecalInfo | null;
+  decalHandles(): Array<{ handle: string; x: number; y: number }>;
+  decalMapTimes(): number[];
+  // The mapped grid of a decal: rows of world points (null where absent).
+  decalGrid(id: string): { columns: number; rows: number; xs: number[]; ys: number[]; points: Array<Vec3 | null> } | null;
+}
+
+export interface DecalInfo {
+  centre: Vec3;
+  right: Vec3;
+  up: Vec3;
+  normal: Vec3;
+  // Top left, top right, bottom right, bottom left (artwork corners).
+  corners: Array<Vec3 | null>;
 }
 
 export function installTestHook(editor: Editor, importer: Importer, bundled: Promise<void>): void {
@@ -115,6 +132,33 @@ export function installTestHook(editor: Editor, importer: Importer, bundled: Pro
     },
     frameTimes: function frameTimes(): number[] {
       return editor.view.frameTimes.slice();
+    },
+    selectedDecal: function selectedDecal(): string | null {
+      return editor.decals.selectedId;
+    },
+    decalInfo: function decalInfo(id: string): DecalInfo | null {
+      return editor.decals.describe(id);
+    },
+    decalHandles: function decalHandles(): Array<{ handle: string; x: number; y: number }> {
+      return editor.decals.handleScreenPoints();
+    },
+    decalMapTimes: function decalMapTimes(): number[] {
+      return editor.decals.mapTimes.slice();
+    },
+    decalGrid: function decalGrid(id: string) {
+      const grid = editor.decals.gridOf(id);
+      if (grid === null) {
+        return null;
+      }
+      const points: Array<Vec3 | null> = [];
+      for (let k = 0; k < grid.present.length; k++) {
+        if (grid.present[k] === 0) {
+          points.push(null);
+        } else {
+          points.push([grid.positions[3 * k], grid.positions[3 * k + 1], grid.positions[3 * k + 2]]);
+        }
+      }
+      return { columns: grid.columns, rows: grid.rows, xs: grid.xs, ys: grid.ys, points: points };
     },
   };
   (window as unknown as { dc6: TestHook }).dc6 = hook;

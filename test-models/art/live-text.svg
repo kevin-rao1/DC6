@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DC6 test art: a badge whose lettering is still live text (not converted to paths). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="50mm" height="20mm" viewBox="0 0 50 20">
+  <rect width="50" height="20" rx="4" fill="#000000"/>
+  <text x="25" y="14" font-family="sans-serif" font-size="10" text-anchor="middle" fill="#e64097">C6</text>
+</svg>

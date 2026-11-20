@@ -7,6 +7,11 @@ import type { PresetView } from './view.ts';
 import type { AssemblyDocument, PlacedPart } from '../model/document.ts';
 import { symmetryMembers } from '../model/document.ts';
 import { renderThumbnail } from './thumbnails.ts';
+import { ColourPopover, ExportDialog, LayerList } from './decal-panels.ts';
+import type { ColourChoice } from './decal-panels.ts';
+import { presetVinyl } from '../model/decals.ts';
+import { drawArtwork } from './decal-visuals.ts';
+import type { Artwork } from '../geometry/artwork.ts';
 
 // Stroke icons, 20 x 20 view box.
 const icons: Record<string, string> = {
@@ -20,6 +25,8 @@ const icons: Record<string, string> = {
   eyeOff: '<path d="M1.5 10S5 4 10 4s8.5 6 8.5 6-3.5 6-8.5 6-8.5-6-8.5-6z" opacity="0.35"/><path d="M3 17L17 3"/>',
   trash: '<path d="M4 6h12M8 6V4h4v2M6 6l1 11h6l1-11"/>',
   plus: '<path d="M10 4v12M4 10h12"/>',
+  flipX: '<path d="M10 3v14" stroke-dasharray="2 2"/><path d="M7 6L3 10l4 4zM13 6l4 4-4 4z"/>',
+  flipY: '<path d="M3 10h14" stroke-dasharray="2 2"/><path d="M6 7l4-4 4 4zM6 13l4 4 4-4z"/>',
 };
 
 function icon(name: string): string {
@@ -48,6 +55,16 @@ export class Ui {
   private readonly bin: HTMLElement;
   private readonly binList: HTMLElement;
   private readonly tree: HTMLElement;
+  private readonly layers: LayerList;
+  private readonly popover: ColourPopover;
+  private readonly exportDialog: ExportDialog;
+  private readonly exportGroup: HTMLElement;
+  private readonly decalGroup: HTMLElement;
+  private readonly notice: HTMLElement;
+  private readonly noticeText: HTMLElement;
+  private readonly replaceInput: HTMLInputElement;
+  private replaceTarget: string | null = null;
+  private readonly artThumbnails = new Map<string, string>();
   private readonly adjust: HTMLElement;
   private readonly empty: HTMLElement;
   private readonly toast: HTMLElement;
@@ -71,7 +88,7 @@ export class Ui {
     this.fileInput = element('input', '', root);
     this.fileInput.type = 'file';
     this.fileInput.multiple = true;
-    this.fileInput.accept = '.step,.stp,.STEP,.STP';
+    this.fileInput.accept = '.step,.stp,.STEP,.STP,.svg,.SVG';
     this.fileInput.style.display = 'none';
     this.fileInput.addEventListener('change', function picked() {
       const files = Array.from(self.fileInput.files ?? []);
@@ -82,7 +99,7 @@ export class Ui {
     // Empty state: the only thing on screen until a file arrives.
     this.empty = element('div', 'empty', root);
     const emptyTitle = element('div', 'empty-title', this.empty);
-    emptyTitle.textContent = 'Drop STEP files here';
+    emptyTitle.textContent = 'Drop STEP and SVG files here';
     const choose = element('button', 'link', this.empty);
     choose.textContent = 'or choose files';
     choose.addEventListener('click', function chooseFiles() {
@@ -120,6 +137,22 @@ export class Ui {
       event.preventDefault();
       editor.stepSymmetry(-1);
     });
+    // Shown while a decal is selected: flip it (H, V).
+    this.decalGroup = element('div', 'group', this.topbar);
+    const flips: Array<['x' | 'y', string, string]> = [
+      ['x', 'flipX', 'Flip horizontally (H)'],
+      ['y', 'flipY', 'Flip vertically (V)'],
+    ];
+    for (let i = 0; i < flips.length; i++) {
+      const axis = flips[i][0];
+      const button = element('button', 'tool', this.decalGroup);
+      button.innerHTML = icon(flips[i][1]);
+      button.title = flips[i][2];
+      button.dataset.control = 'flip-' + axis;
+      button.addEventListener('click', function flip() {
+        editor.decals.flipSelected(axis);
+      });
+    }
     const history = element('div', 'group', this.topbar);
     this.undoButton = element('button', 'tool', history);
     this.undoButton.innerHTML = icon('undo');
@@ -134,6 +167,10 @@ export class Ui {
       editor.redo();
     });
     element('div', 'spacer', this.topbar);
+    this.exportGroup = element('div', 'group', this.topbar);
+    const exportButton = element('button', 'view', this.exportGroup);
+    exportButton.textContent = 'Export';
+    exportButton.dataset.control = 'export';
     const views = element('div', 'group views', this.topbar);
     const viewList: Array<[PresetView | 'fit', string]> = [
       ['side', 'Side'],
@@ -156,15 +193,49 @@ export class Ui {
     this.bin = element('div', 'bin', root);
     const add = element('button', 'bin-add', this.bin);
     add.innerHTML = icon('plus');
-    add.title = 'Add STEP files';
+    add.title = 'Add STEP or SVG files';
     add.addEventListener('click', function addFiles() {
       self.fileInput.click();
     });
     this.binList = element('div', 'bin-list', this.bin);
 
-    this.tree = element('div', 'tree', root);
+    // The right-hand column: the rocket tree, and the decals as layers under it.
+    const side = element('div', 'side', root);
+    this.tree = element('div', 'tree', side);
+    this.popover = new ColourPopover(root);
+    this.replaceInput = element('input', '', root);
+    this.replaceInput.type = 'file';
+    this.replaceInput.accept = '.svg,.SVG';
+    this.replaceInput.style.display = 'none';
+    this.replaceInput.addEventListener('change', function picked() {
+      const files = Array.from(self.replaceInput.files ?? []);
+      self.replaceInput.value = '';
+      const target = self.replaceTarget;
+      self.replaceTarget = null;
+      if (files.length > 0 && target !== null) {
+        self.replaceArtwork(target, files[0]);
+      }
+    });
+    this.layers = new LayerList(side, editor, this.popover, function chooseReplacement(decalId: string) {
+      self.replaceTarget = decalId;
+      self.replaceInput.click();
+    });
+    this.exportDialog = new ExportDialog(root, editor);
+    exportButton.addEventListener('click', function openExport() {
+      self.exportDialog.toggle(exportButton);
+    });
     this.adjust = element('div', 'adjust', root);
     this.toast = element('div', 'toast', root);
+    // A notice about an imported file: stays until dismissed.
+    this.notice = element('div', 'notice', root);
+    this.noticeText = element('span', '', this.notice);
+    const dismiss = element('button', 'notice-close', this.notice);
+    dismiss.textContent = '×';
+    dismiss.title = 'Dismiss';
+    dismiss.addEventListener('click', function close() {
+      self.notice.style.display = 'none';
+    });
+    this.notice.style.display = 'none';
 
     // Drag and drop anywhere in the window.
     let dragDepth = 0;
@@ -218,6 +289,30 @@ export class Ui {
     this.refresh();
   }
 
+  // Problems with an imported file the user should know about.
+  showNotice(lines: string[]): void {
+    if (lines.length === 0) {
+      return;
+    }
+    this.noticeText.textContent = lines.join(' ');
+    this.notice.style.display = '';
+  }
+
+  private replaceArtwork(decalId: string, file: File): void {
+    const self = this;
+    file.text().then(function read(text) {
+      try {
+        const result = self.editor.decals.addArtwork(text, file.name);
+        self.showNotice(result.notices);
+        if (result.artwork !== null) {
+          self.editor.decals.replaceArtwork(decalId, result.artwork);
+        }
+      } catch (error) {
+        self.showError(file.name + ': ' + (error instanceof Error ? error.message : String(error)));
+      }
+    });
+  }
+
   showError(message: string): void {
     this.toast.textContent = message;
     this.toast.classList.add('visible');
@@ -242,7 +337,7 @@ export class Ui {
 
   refresh(): void {
     const editor = this.editor;
-    const hasParts = editor.partOrder.length > 0 || this.pending.length > 0;
+    const hasParts = editor.partOrder.length > 0 || this.pending.length > 0 || editor.decals.artworkOrder.length > 0;
     this.root.classList.toggle('has-parts', hasParts);
     this.empty.style.display = hasParts ? 'none' : '';
     this.topbar.style.display = hasParts ? '' : 'none';
@@ -253,11 +348,14 @@ export class Ui {
     });
     this.symmetryButton.textContent = '×' + String(editor.symmetryCount);
     this.symmetryButton.classList.toggle('active', editor.symmetryCount > 1);
+    this.decalGroup.style.display = editor.decals.selectedId !== null ? '' : 'none';
+    this.exportGroup.style.display = editor.document.decals.length > 0 ? '' : 'none';
     this.undoButton.disabled = !editor.history.canUndo();
     this.redoButton.disabled = !editor.history.canRedo();
 
     this.refreshBin();
     this.refreshTree();
+    this.layers.refresh();
     this.refreshAdjust();
   }
 
@@ -302,6 +400,40 @@ export class Ui {
       const label = element('div', 'bin-name', item);
       label.textContent = this.pending[i].name.replace(/\.(step|stp)$/i, '');
     }
+    // The imported artwork, below the parts: click one and it follows the
+    // cursor over the rocket, stuck to the surface, until a click drops it.
+    const decals = editor.decals;
+    if (decals.artworkOrder.length > 0 && editor.partOrder.length > 0) {
+      element('div', 'bin-rule', list);
+    }
+    const heldArt = decals.heldArtworkId();
+    for (let i = 0; i < decals.artworkOrder.length; i++) {
+      const artworkId = decals.artworkOrder[i];
+      const artwork = decals.requireArtwork(artworkId);
+      const item = element('div', 'bin-item art-item', list);
+      item.dataset.artworkId = artworkId;
+      item.dataset.artworkName = artwork.name;
+      item.title = artwork.name + ' · ' + artwork.width.toFixed(1) + ' × ' + artwork.height.toFixed(1) + ' mm';
+      item.classList.toggle('held', heldArt === artworkId);
+      let url = this.artThumbnails.get(artworkId);
+      if (url === undefined) {
+        url = artworkThumbnail(artwork);
+        this.artThumbnails.set(artworkId, url);
+      }
+      const image = element('img', '', item);
+      image.src = url;
+      image.alt = '';
+      image.draggable = false;
+      const label = element('div', 'bin-name', item);
+      label.textContent = artwork.name;
+      item.addEventListener('pointerdown', function pick(event) {
+        if (event.button !== 0) {
+          return;
+        }
+        event.preventDefault();
+        decals.pickArtwork(artworkId);
+      });
+    }
   }
 
   private refreshTree(): void {
@@ -325,6 +457,22 @@ export class Ui {
         text = text + ' ×' + String(placed.symmetry.count);
       }
       name.textContent = text;
+      // Preview base colour of the part (paint or bare material).
+      const colour = doc.partColours[placed.id];
+      const swatch = element('button', 'swatch part-swatch', row);
+      swatch.title = 'Preview colour';
+      if (colour === undefined) {
+        swatch.classList.add('default');
+      } else {
+        swatch.style.background = colour;
+      }
+      const popover = this.popover;
+      swatch.addEventListener('click', function pickColour(event) {
+        event.stopPropagation();
+        popover.open(swatch, partColourChoices(doc), colour === undefined ? null : colour, function chosen(picked) {
+          editor.decals.setPartColour(placed.id, picked);
+        });
+      });
       const remove = element('button', 'row-button remove', row);
       remove.innerHTML = icon('trash');
       remove.title = 'Delete (Del)';
@@ -382,9 +530,39 @@ export class Ui {
         ['Up', 'mm'],
         ['Side', 'mm'],
       ];
-    } else {
-      title.textContent = 'Rotate about ' + axisName(operation.axis);
+    } else if (operation.kind === 'rotate') {
+      title.textContent = 'Rotate about';
+      // The axis can be changed afterwards, as in Blender.
+      const axes = element('div', 'segmented', this.adjust);
+      const names: Array<'along' | 'up' | 'side'> = ['along', 'up', 'side'];
+      for (let i = 0; i < names.length; i++) {
+        const axis = names[i];
+        const button = element('button', '', axes);
+        button.textContent = axisName(axis);
+        button.dataset.axis = axis;
+        button.classList.toggle('active', operation.axis === axis);
+        button.addEventListener('click', function chooseAxis() {
+          self.editor.adjustLastOperation([operation.degrees], axis);
+          self.adjustFor = null;
+          self.refresh();
+        });
+      }
       rows = [['Angle', '°']];
+    } else if (operation.kind === 'decal-move') {
+      title.textContent = 'Move';
+      rows = [
+        ['Along', 'mm'],
+        ['Around', 'mm'],
+      ];
+    } else if (operation.kind === 'decal-rotate') {
+      title.textContent = 'Rotate';
+      rows = [['Angle', '°']];
+    } else {
+      title.textContent = 'Scale';
+      rows = [
+        ['Width', 'mm'],
+        ['Height', 'mm'],
+      ];
     }
     for (let r = 0; r < rows.length; r++) {
       const row = element('label', 'adjust-row', this.adjust);
@@ -434,6 +612,15 @@ export class Ui {
         values.push(value);
       }
     }
+    if (operation.kind === 'decal-scale') {
+      // Width and height are linked: the one typed sets the other.
+      const ratio = operation.start.height / operation.start.width;
+      if (Math.abs(values[0] - current[0]) > 1e-9) {
+        values[1] = values[0] * ratio;
+      } else if (Math.abs(values[1] - current[1]) > 1e-9) {
+        values[0] = values[1] / ratio;
+      }
+    }
     this.editor.adjustLastOperation(values);
   }
 }
@@ -442,17 +629,54 @@ function operationValues(operation: LastOperation): number[] {
   if (operation.kind === 'move') {
     return [operation.along, operation.up, operation.side];
   }
+  if (operation.kind === 'decal-move') {
+    return [operation.along, operation.around];
+  }
+  if (operation.kind === 'decal-scale') {
+    return [operation.width, operation.height];
+  }
   return [operation.degrees];
+}
+
+// Preview colours for a part: the plain grey, white, the vinyl colours.
+function partColourChoices(doc: AssemblyDocument): ColourChoice[] {
+  const choices: ColourChoice[] = [{ colour: null, title: 'Plain' }, { colour: '#f2f2f2', title: 'White' }];
+  for (let i = 0; i < presetVinyl.length; i++) {
+    choices.push({ colour: presetVinyl[i].colour, title: presetVinyl[i].name });
+  }
+  for (let i = 0; i < doc.vinylColours.length; i++) {
+    choices.push({ colour: doc.vinylColours[i], title: doc.vinylColours[i] });
+  }
+  return choices;
+}
+
+// A thumbnail of artwork on the part grey, so black and cerise both show.
+function artworkThumbnail(artwork: Artwork): string {
+  const size = 132;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext('2d');
+  if (context === null) {
+    throw new Error('artworkThumbnail: no 2D canvas context');
+  }
+  context.fillStyle = '#9b9ba0';
+  context.fillRect(0, 0, size, size);
+  const inner = size - 20;
+  const scale = inner / Math.max(artwork.width, artwork.height);
+  context.translate((size - artwork.width * scale) / 2, (size - artwork.height * scale) / 2);
+  drawArtwork(context, artwork, {}, scale);
+  return canvas.toDataURL('image/png');
 }
 
 function axisName(axis: 'along' | 'up' | 'side'): string {
   if (axis === 'along') {
-    return 'the axis';
+    return 'Axis';
   }
   if (axis === 'up') {
-    return 'up';
+    return 'Up';
   }
-  return 'side';
+  return 'Side';
 }
 
 function hasFiles(event: DragEvent): boolean {

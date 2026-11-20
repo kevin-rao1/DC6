@@ -19,7 +19,7 @@ import type { Vec3 } from './vec3.ts';
 import { add, cross, dot, length, normalize, scale, sub } from './vec3.ts';
 import { applyToDirection, applyToPoint } from './transform.ts';
 import type { Surface, SurfacePoint, Walker } from './geodesic.ts';
-import { cloneWalker, pieceIndex, startWalk, walk, worldDirection, worldNormal, worldPoint } from './geodesic.ts';
+import { cloneWalker, creaseAngle, pieceIndex, startWalk, walk, worldDirection, worldNormal, worldPoint } from './geodesic.ts';
 import { barycentricOf, pointFromBarycentric, smoothNormal, triangleNormal } from './surface-mesh.ts';
 import { WORLD_UP } from './rocket-axis.ts';
 
@@ -183,6 +183,42 @@ export function walkFrame(surface: Surface, frame: DecalFrame, dx: number, dy: n
   const endHeading = worldDirection(surface, walker);
   const right = rotateInPlane(endHeading, endNormal, offset);
   return { at: { piece: walker.piece, triangle: walker.triangle, point: walker.point }, right: right };
+}
+
+// Carry the decal's frame at the cursor from where it was to the surface
+// point now under the cursor: walk along the surface towards it (so the
+// frame is carried by the same geodesic rules as the map, across joints),
+// then step onto the point under the cursor, projecting the frame onto its
+// tangent plane. If the point under the cursor turns sharply away from where
+// the walk arrived (the cursor is over the crack between two parts and the
+// ray found an end face, or over a fin standing on the body), the walk's
+// end stands instead: the decal goes no further than the surface allows.
+export function followCursor(surface: Surface, from: DecalFrame, target: SurfacePoint): DecalFrame | null {
+  const start = worldPoint(surface, from.at);
+  const normal = worldNormal(surface, from.at);
+  const chord = sub(worldPoint(surface, target), start);
+  const inPlane = sub(chord, scale(normal, dot(chord, normal)));
+  let arrived: DecalFrame = from;
+  const distance = length(inPlane);
+  if (distance > 1e-6) {
+    const direction = scale(inPlane, 1 / distance);
+    const up = cross(normal, from.right);
+    const walked = walkFrame(surface, from, distance * dot(direction, from.right), distance * dot(direction, up));
+    if (walked !== null) {
+      arrived = walked;
+    }
+  }
+  const arrivedNormal = worldNormal(surface, arrived.at);
+  const targetNormal = worldNormal(surface, target);
+  const turn = Math.acos(Math.max(-1, Math.min(1, dot(arrivedNormal, targetNormal))));
+  if (turn >= creaseAngle) {
+    return arrived;
+  }
+  const onTarget = frameAt(surface, target, arrived.right);
+  if (onTarget === null) {
+    return arrived;
+  }
+  return onTarget;
 }
 
 // Evenly spaced coordinates from -half to +half with an even number of

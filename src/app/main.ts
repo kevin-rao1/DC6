@@ -40,11 +40,32 @@ async function openFile(name: string, bytes: ArrayBuffer): Promise<void> {
   }
 }
 
+// An SVG file becomes artwork in the decal list.
+function openSvg(name: string, text: string): void {
+  try {
+    const result = editor.decals.addArtwork(text, name);
+    ui.showNotice(result.notices);
+  } catch (error) {
+    let message = String(error);
+    if (error instanceof Error) {
+      message = error.message;
+    }
+    ui.showError(name + ': ' + message);
+  }
+  editor.notify();
+}
+
 function openFiles(files: File[]): void {
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
+    if (/\.svg$/i.test(file.name)) {
+      file.text().then(function read(text) {
+        openSvg(file.name, text);
+      });
+      continue;
+    }
     if (!/\.(step|stp)$/i.test(file.name)) {
-      ui.showError(file.name + ' is not a STEP file.');
+      ui.showError(file.name + ' is neither a STEP nor an SVG file.');
       continue;
     }
     file.arrayBuffer().then(function read(bytes) {

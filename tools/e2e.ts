@@ -1,4 +1,4 @@
-// End-to-end check of stage 1, driving the built app with real mouse events
+// End-to-end check of stages 1 to 3, driving the built app with real mouse events
 // (page.mouse move/down/up and real key presses; nothing is placed by calling
 // the editor). window.dc6 is only used to find where things are on screen and
 // to read the resulting document.
@@ -12,12 +12,18 @@
 // pushed 70 mm aft by typing "+70" (its internals go into the tube); the
 // nose is snapped onto the can's spigot and then dragged 12 mm aft with the
 // move gizmo, so it screws over the spigot and its rim meets the can's shoulder.
+// The fins are dropped 40 degrees above the side and snap to 45 (15 degree
+// roll steps from straight up).
+//
+// Then decals (stage 2) and the cut file (stage 3): see decalSteps below.
 
 import { preview } from 'vite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import type { Page, Playwright } from './playwright-types.ts';
+import { readFileSync } from 'node:fs';
+import type { DecalInfo } from '../src/app/test-hook.ts';
 import type { AssemblyDocument, PlacedPart } from '../src/model/document.ts';
 import type { TestHook, WorldFace } from '../src/app/test-hook.ts';
 import type { Vec3 } from '../src/geometry/vec3.ts';
@@ -102,6 +108,8 @@ async function click(page: Page, x: number, y: number): Promise<void> {
 }
 
 async function clickSelector(page: Page, selector: string): Promise<void> {
+  // As a user scrolls a long list to reach an item.
+  await page.locator(selector).first().scrollIntoViewIfNeeded();
   const box = await page.locator(selector).first().boundingBox();
   if (box === null) {
     throw new Error('no element for ' + selector);
@@ -385,8 +393,9 @@ async function main(): Promise<void> {
     check(symmetryText === '×4', 'symmetry set to x4');
     await clickSelector(page, '.bin-item[data-part-name="fin"]');
     await glide(page, emptySpot.x, emptySpot.y, 6);
-    // On the tube, 60 mm forward of its aft end, a little above the side facing us.
-    const angle = (30 * Math.PI) / 180;
+    // On the tube, 60 mm forward of its aft end, 40 degrees above the side
+    // facing us: the roll snaps to 45 (15 degree steps from straight up).
+    const angle = (40 * Math.PI) / 180;
     const finPoint = await screenOf(page, [tubeAft.centre[0] - 60, body.outerRadius * Math.sin(angle), body.outerRadius * Math.cos(angle)]);
     await glide(page, finPoint.x, finPoint.y, 20);
     check((await heldSnap(page)) === 'surface', 'the held fin stands on the tube surface');
@@ -494,6 +503,9 @@ async function main(): Promise<void> {
       const inward = (root.normal[1] * root.centre[1] + root.normal[2] * root.centre[2]) / radialLength;
       check(inward < -1 + 1e-6, 'fin ' + String(i + 1) + ' stands square to the tube');
       angles.push(Math.atan2(root.centre[2], root.centre[1]));
+      const fromUp = (Math.atan2(root.centre[2], root.centre[1]) * 180) / Math.PI;
+      const offStep = Math.abs(fromUp / 15 - Math.round(fromUp / 15)) * 15;
+      check(offStep < 1e-6, 'fin ' + String(i + 1) + ' roll is a 15 degree step from straight up (' + fromUp.toFixed(4) + ' deg)');
     }
     angles.sort(function ascending(a, b) {
       return a - b;
@@ -503,6 +515,8 @@ async function main(): Promise<void> {
       const spacing = ((next - angles[i]) * 180) / Math.PI;
       check(Math.abs(spacing - 90) < 1e-6, 'neighbouring fins are 90 degrees apart (' + spacing.toFixed(6) + ')');
     }
+    await decalSteps(page, names, canvas);
+
     const frameTimes = await page.evaluate(function times() {
       return window.dc6.frameTimes();
     });
@@ -528,6 +542,536 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   console.log('all checks passed');
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 and 3: decals on the rocket, and the cut file.
+
+const artFolder = join(process.cwd(), 'test-models', 'art');
+
+async function decalInfo(page: Page, id: string): Promise<DecalInfo> {
+  const info = await page.evaluate(function read(decalId: string) {
+    return window.dc6.decalInfo(decalId);
+  }, id);
+  if (info === null) {
+    throw new Error('decal ' + id + ' is not drawn');
+  }
+  return info;
+}
+
+function decalNamed(doc: AssemblyDocument, name: string): AssemblyDocument['decals'][number] {
+  for (let i = 0; i < doc.decals.length; i++) {
+    if (doc.decals[i].name === name) {
+      return doc.decals[i];
+    }
+  }
+  throw new Error('no decal named ' + name);
+}
+
+async function handles(page: Page): Promise<Array<{ handle: string; x: number; y: number }>> {
+  return page.evaluate(function read() {
+    return window.dc6.decalHandles();
+  });
+}
+
+async function typeInto(page: Page, selector: string, text: string): Promise<void> {
+  const box = await page.locator(selector).first().boundingBox();
+  if (box === null) {
+    throw new Error('no field ' + selector);
+  }
+  await click(page, box.x + box.width / 2, box.y + box.height / 2);
+  await page.keyboard.type(text, { delay: 20 });
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(150);
+}
+
+async function pickArt(page: Page, name: string, at: { x: number; y: number }): Promise<void> {
+  await clickSelector(page, '.art-item[data-artwork-name="' + name + '"]');
+  await glide(page, at.x, at.y, 12);
+  await click(page, at.x, at.y);
+}
+
+// The unwrapped roll angle covered by the centre row of a decal's grid.
+async function rollSpan(page: Page, id: string): Promise<{ degrees: number; missing: number }> {
+  const grid = await page.evaluate(function read(decalId: string) {
+    return window.dc6.decalGrid(decalId);
+  }, id);
+  if (grid === null) {
+    throw new Error('no grid for ' + id);
+  }
+  const row = (grid.rows - 1) / 2;
+  let previous: number | null = null;
+  let turned = 0;
+  let missing = 0;
+  for (let i = 0; i < grid.columns; i++) {
+    const p = grid.points[row * grid.columns + i];
+    if (p === null) {
+      missing = missing + 1;
+      continue;
+    }
+    const angle = Math.atan2(p[1], p[2]);
+    if (previous !== null) {
+      let step = angle - previous;
+      if (step > Math.PI) {
+        step = step - 2 * Math.PI;
+      } else if (step < -Math.PI) {
+        step = step + 2 * Math.PI;
+      }
+      turned = turned + step;
+    }
+    previous = angle;
+  }
+  return { degrees: (Math.abs(turned) * 180) / Math.PI, missing: missing };
+}
+
+function plainSvgProblems(svg: string): string[] {
+  const problems: string[] = [];
+  if (/transform=/.test(svg)) {
+    problems.push('has a transform');
+  }
+  if (/style=|<style/.test(svg)) {
+    problems.push('has CSS');
+  }
+  if (/<use|clip-path|clipPath/.test(svg)) {
+    problems.push('has use or clip paths');
+  }
+  const size = /<svg[^>]* width="([\d.]+)mm" height="([\d.]+)mm" viewBox="0 0 ([\d.]+) ([\d.]+)"/.exec(svg);
+  if (size === null || size[1] !== size[3] || size[2] !== size[4]) {
+    problems.push('size in mm does not match the viewBox');
+  }
+  const paths = svg.match(/<path [^>]*>/g) ?? [];
+  if (paths.length === 0) {
+    problems.push('no paths');
+  }
+  for (let i = 0; i < paths.length; i++) {
+    const d = /d="([^"]*)"/.exec(paths[i]);
+    if (d === null || !/^[MLCZ0-9 .\-]+$/.test(d[1]) || !d[1].trim().endsWith('Z')) {
+      problems.push('path ' + String(i) + ' is not closed absolute data');
+      break;
+    }
+    if (!/fill="none"/.test(paths[i])) {
+      problems.push('path ' + String(i) + ' is filled');
+      break;
+    }
+  }
+  return problems;
+}
+
+async function decalSteps(page: Page, names: Record<string, string>, canvas: { x: number; y: number; width: number; height: number }): Promise<void> {
+  let doc = await documentOf(page);
+  const tube = one(doc, names, 'tube');
+  const nose = one(doc, names, 'nose');
+  const tubeFaces = await faces(page, tube.id);
+  const tubeFore = faceFacing(tubeFaces, body.outerRadius, -1);
+  const tubeAft = faceFacing(tubeFaces, body.outerRadius, 1);
+  const tubeMiddleX = (tubeFore.centre[0] + tubeAft.centre[0]) / 2;
+  await page.keyboard.press('Escape');
+  await fitView(page);
+
+  console.log('12. import artwork: two logos with paths, a band, and a file with live text');
+  const input = page.locator('input[type=file]').first();
+  await input.setInputFiles([join(artFolder, 'logo.svg'), join(artFolder, 'lettering.svg'), join(artFolder, 'stripe.svg')]);
+  await page.waitForTimeout(400);
+  check((await page.locator('.art-item').count()) === 3, 'three artworks in the list');
+  check(!(await page.locator('.notice').isVisible()), 'clean files give no notice');
+  await input.setInputFiles([join(artFolder, 'live-text.svg')]);
+  await page.waitForTimeout(300);
+  const noticeText = (await page.locator('.notice').textContent()) ?? '';
+  check(/live text/.test(noticeText) && /paths/.test(noticeText), 'live text gives a notice naming the problem (' + noticeText.replace('×', '').trim() + ')');
+  await shot(page, 'live-text-notice');
+  await clickSelector(page, '.notice-close');
+  check(!(await page.locator('.notice').isVisible()), 'the notice is dismissed');
+
+  console.log('13. the tube in white (preview colour)');
+  await clickSelector(page, '.tree-row[data-placed-id="' + tube.id + '"] .part-swatch');
+  await clickSelector(page, '.popover .swatch[data-colour="#f2f2f2"]');
+  doc = await documentOf(page);
+  check(doc.partColours[tube.id] === '#f2f2f2', 'the tube is previewed white');
+
+  console.log('14. drop the lettering on the side of the tube');
+  const onTube = await screenOf(page, [tubeMiddleX - 40, 0, 0]);
+  await clickSelector(page, '.art-item[data-artwork-name="lettering"]');
+  await glide(page, onTube.x, onTube.y, 12);
+  await shot(page, 'lettering-held');
+  await click(page, onTube.x, onTube.y);
+  doc = await documentOf(page);
+  check(doc.decals.length === 1, 'one decal');
+  let lettering = decalNamed(doc, 'lettering');
+  check(lettering.anchor.placedId === tube.id, 'the lettering is on the tube');
+  check(Math.abs(lettering.width - 60) < 1e-6 && Math.abs(lettering.height - 20) < 1e-3, 'at true size, 60 x 20 mm (' + lettering.width.toFixed(3) + ' x ' + lettering.height.toFixed(3) + ')');
+  let info = await decalInfo(page, lettering.id);
+  check(info.up[1] > 0.95 && info.right[0] > 0.99, 'artwork up is world up, artwork right is towards the tail');
+  const topLeft = await screenOf(page, info.corners[0] as Vec3);
+  const topRight = await screenOf(page, info.corners[1] as Vec3);
+  const bottomLeft = await screenOf(page, info.corners[3] as Vec3);
+  check(topLeft.y < bottomLeft.y - 10 && topLeft.x < topRight.x - 50, 'in the side view the lettering is upright and reads left to right');
+  await shot(page, 'lettering-on-tube');
+
+  console.log('15. drag it along and around the body; type an exact distance');
+  const startCentre = info.centre;
+  let at = await screenOf(page, info.centre);
+  await glide(page, at.x, at.y, 3);
+  await page.mouse.down();
+  await glide(page, at.x + 90, at.y - 35, 16);
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+  info = await decalInfo(page, lettering.id);
+  const alongValue = Number(await page.locator('.adjust input[data-field="along"]').first().inputValue());
+  const aroundValue = Number(await page.locator('.adjust input[data-field="around"]').first().inputValue());
+  check(alongValue > 20 && aroundValue > 5, 'the adjust panel shows along ' + alongValue + ' mm and around ' + aroundValue + ' mm');
+  await typeInto(page, '.adjust input[data-field="along"]', '50');
+  info = await decalInfo(page, lettering.id);
+  check(Math.abs(info.centre[0] - startCentre[0] - 50) < 0.05, 'typing 50 moves it exactly 50 mm along (' + (info.centre[0] - startCentre[0]).toFixed(3) + ')');
+  check(info.right[0] > 0.99, 'still square to the axis after moving round (right . axis = ' + info.right[0].toFixed(4) + ')');
+  await shot(page, 'lettering-moved');
+
+  console.log('16. drag it over the can and onto the nose, in small steps');
+  at = await screenOf(page, info.centre);
+  const noseFaces = await faces(page, nose.id);
+  const noseBase = faceOfRadius(noseFaces, body.outerRadius);
+  const target = await screenOf(page, [noseBase.centre[0] - 45, 0, 0]);
+  await glide(page, at.x, at.y, 3);
+  await page.mouse.down();
+  const steps = Math.ceil(Math.hypot(target.x - at.x, target.y - at.y) / 6);
+  let previous: DecalInfo | null = null;
+  let worstJump = 0;
+  let worstTurn = 0;
+  let worstTurnAt: Vec3 = [0, 0, 0];
+  let travelled = 0;
+  const dragStart = Date.now();
+  for (let k = 1; k <= steps; k++) {
+    const x = at.x + ((target.x - at.x) * k) / steps;
+    const y = at.y + ((target.y - at.y) * k) / steps;
+    await page.mouse.move(x, y);
+    await page.waitForTimeout(20);
+    const now = await decalInfo(page, lettering.id);
+    if (previous !== null) {
+      const jump = distance(now.centre, previous.centre);
+      travelled = travelled + jump;
+      worstJump = Math.max(worstJump, jump);
+      // Spin about the surface normal: the previous right, laid into the
+      // current tangent plane, against the current right. (Tilting with the
+      // surface, as over the kink where the waisted can meets the tube, is
+      // not a spin.)
+      const n = now.normal;
+      const p = previous.right;
+      const along = p[0] * n[0] + p[1] * n[1] + p[2] * n[2];
+      const laid: Vec3 = [p[0] - along * n[0], p[1] - along * n[1], p[2] - along * n[2]];
+      const laidLength = Math.hypot(laid[0], laid[1], laid[2]);
+      const cosine = (laid[0] * now.right[0] + laid[1] * now.right[1] + laid[2] * now.right[2]) / laidLength;
+      const turn = Math.acos(Math.min(1, cosine));
+      if ((turn * 180) / Math.PI > worstTurn) {
+        worstTurn = (turn * 180) / Math.PI;
+        worstTurnAt = now.centre;
+      }
+    }
+    previous = now;
+    if (k === Math.round(steps * 0.55)) {
+      await shot(page, 'lettering-crossing-the-can');
+    }
+  }
+  const dragSeconds = (Date.now() - dragStart) / 1000;
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+  doc = await documentOf(page);
+  lettering = decalNamed(doc, 'lettering');
+  check(lettering.anchor.placedId === nose.id, 'the lettering is now on the nose');
+  const meanStep = travelled / Math.max(1, steps - 1);
+  check(worstJump < 3 * meanStep + 0.5, 'it slid without a jump: largest step ' + worstJump.toFixed(2) + ' mm, mean ' + meanStep.toFixed(2) + ' mm');
+  check(worstTurn < 3, 'its frame never flipped or spun: largest turn about the normal per step ' + worstTurn.toFixed(2) + ' deg (at ' + worstTurnAt.map(function f(v) {
+    return v.toFixed(1);
+  }).join(', ') + ')');
+  info = await decalInfo(page, lettering.id);
+  check(info.up[1] > 0.7, 'upright on the nose (up . world up = ' + info.up[1].toFixed(3) + ')');
+  await shot(page, 'lettering-on-nose');
+  const mapTimes = await page.evaluate(function read() {
+    return window.dc6.decalMapTimes();
+  });
+  let mapTotal = 0;
+  let mapWorst = 0;
+  for (let i = 0; i < mapTimes.length; i++) {
+    mapTotal = mapTotal + mapTimes[i];
+    mapWorst = Math.max(mapWorst, mapTimes[i]);
+  }
+  console.log('drag: ' + String(steps) + ' pointer moves in ' + dragSeconds.toFixed(1) + ' s with software GL; decal re-map mean ' + (mapTotal / Math.max(1, mapTimes.length)).toFixed(2) + ' ms, worst ' + mapWorst.toFixed(2) + ' ms over ' + String(mapTimes.length));
+
+  console.log('17. turn it with the rotate handle (15 degree steps)');
+  let list = await handles(page);
+  const centreScreen = await screenOf(page, info.centre);
+  const rotateHandle = list.filter(function isRotate(h) {
+    return h.handle === 'rotate';
+  })[0];
+  check(rotateHandle !== undefined && list.length === 5, 'four corner handles and a rotate handle are shown');
+  const startRotation = lettering.rotation;
+  await glide(page, rotateHandle.x, rotateHandle.y, 3);
+  await page.mouse.down();
+  const radius = Math.hypot(rotateHandle.x - centreScreen.x, rotateHandle.y - centreScreen.y);
+  const startAngle = Math.atan2(rotateHandle.y - centreScreen.y, rotateHandle.x - centreScreen.x);
+  for (let k = 1; k <= 10; k++) {
+    // Clockwise on screen by 32 degrees: snaps to 30.
+    const a = startAngle + (((32 * Math.PI) / 180) * k) / 10;
+    await page.mouse.move(centreScreen.x + radius * Math.cos(a), centreScreen.y + radius * Math.sin(a));
+    await page.waitForTimeout(20);
+  }
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+  doc = await documentOf(page);
+  lettering = decalNamed(doc, 'lettering');
+  // The angle snaps to 15 degree steps from upright (rotation 0), so
+  // upright is always one snap away.
+  const turnedDegrees = ((lettering.rotation - startRotation) * 180) / Math.PI;
+  const absoluteDegrees = (lettering.rotation * 180) / Math.PI;
+  const offStep = Math.abs(absoluteDegrees / 15 - Math.round(absoluteDegrees / 15)) * 15;
+  check(offStep < 1e-6 && Math.abs(turnedDegrees) > 20, 'it turned ' + turnedDegrees.toFixed(2) + ' deg, to ' + absoluteDegrees.toFixed(4) + ' deg from upright, a 15 degree step');
+  await shot(page, 'lettering-rotated');
+  const shownAngle = Number(await page.locator('.adjust input[data-field="angle"]').first().inputValue());
+  check(Math.abs(shownAngle - absoluteDegrees) < 0.05, 'the panel shows the angle from upright: ' + shownAngle);
+  await typeInto(page, '.adjust input[data-field="angle"]', '0');
+  doc = await documentOf(page);
+  lettering = decalNamed(doc, 'lettering');
+  info = await decalInfo(page, lettering.id);
+  check(Math.abs(lettering.rotation) < 1e-9 && info.up[1] > 0.9, 'typing 0 stands it upright (up . world up = ' + info.up[1].toFixed(3) + ')');
+
+  console.log('18. scale it with a corner handle, then type an exact width');
+  list = await handles(page);
+  const corner = list.filter(function isCorner(h) {
+    return h.handle === 'scale';
+  })[1];
+  await glide(page, corner.x, corner.y, 3);
+  await page.mouse.down();
+  await glide(page, centreScreen.x + (corner.x - centreScreen.x) * 1.3, centreScreen.y + (corner.y - centreScreen.y) * 1.3, 10);
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+  doc = await documentOf(page);
+  lettering = decalNamed(doc, 'lettering');
+  check(lettering.width > 66 && Math.abs(lettering.width / lettering.height - 3) < 1e-3, 'the corner scales it uniformly (' + lettering.width.toFixed(1) + ' x ' + lettering.height.toFixed(1) + ' mm)');
+  await typeInto(page, '.adjust input[data-field="width"]', '45');
+  doc = await documentOf(page);
+  lettering = decalNamed(doc, 'lettering');
+  check(Math.abs(lettering.width - 45) < 1e-9 && Math.abs(lettering.height - 15) < 1e-3, 'typing 45 mm makes it 45 x ' + lettering.height.toFixed(4) + ' mm (height linked)');
+  await shot(page, 'lettering-scaled');
+
+  console.log('19. a logo on the tube, a band round the tube, a logo on a fin');
+  await page.keyboard.press('Escape');
+  // The logo straddles the joint between the tube and the waisted can, and
+  // the band goes over it: layering and the part joint in one place.
+  await pickArt(page, 'logo', await screenOf(page, [tubeFore.centre[0] + 6, 0, 0]));
+  await pickArt(page, 'stripe', await screenOf(page, [tubeFore.centre[0] + 18, 0, 0]));
+  doc = await documentOf(page);
+  const stripe = decalNamed(doc, 'stripe');
+  check(stripe.anchor.placedId === tube.id, 'the band is on the tube');
+  // Turn it to run round the tube: drag the rotate handle a little, then type 90.
+  list = await handles(page);
+  const bandRotate = list.filter(function isRotate(h) {
+    return h.handle === 'rotate';
+  })[0];
+  if (bandRotate === undefined) {
+    throw new Error('no rotate handle on the band');
+  }
+  await glide(page, bandRotate.x, bandRotate.y, 3);
+  await page.mouse.down();
+  await glide(page, bandRotate.x + 60, bandRotate.y + 10, 6);
+  await page.mouse.up();
+  await page.waitForTimeout(100);
+  await typeInto(page, '.adjust input[data-field="angle"]', '90');
+  const span = await rollSpan(page, stripe.id);
+  check(span.degrees > 360 && span.missing === 0, 'the 300 mm band wraps more than once round the 207 mm tube: ' + span.degrees.toFixed(1) + ' degrees');
+  await shot(page, 'band-wrapped');
+  const fins = placedOfPart(doc, names, 'fin');
+  let frontFin = fins[0];
+  for (let i = 0; i < fins.length; i++) {
+    const root = (await faces(page, fins[i].id))[fins[i].joint === null ? 0 : fins[i].joint!.ownFace];
+    if (root.centre[1] > 1 && root.centre[2] > 1) {
+      frontFin = fins[i];
+    }
+  }
+  const finFaces = await faces(page, frontFin.id);
+  let side = finFaces[0];
+  let best = -Infinity;
+  const towardsCamera: Vec3 = [0, Math.sin((12 * Math.PI) / 180), Math.cos((12 * Math.PI) / 180)];
+  for (let i = 0; i < finFaces.length; i++) {
+    const facing = finFaces[i].normal[0] * towardsCamera[0] + finFaces[i].normal[1] * towardsCamera[1] + finFaces[i].normal[2] * towardsCamera[2];
+    if (finFaces[i].radius === null && facing > best) {
+      best = facing;
+      side = finFaces[i];
+    }
+  }
+  await pickArt(page, 'logo', await screenOf(page, side.centre));
+  doc = await documentOf(page);
+  const finLogo = doc.decals[doc.decals.length - 1];
+  check(finLogo.anchor.placedId === frontFin.id, 'the second logo is on a fin');
+  info = await decalInfo(page, finLogo.id);
+  check(info.up[1] > 0.5 && info.right[0] > 0.99, 'on the fin it is upright seen from outside (up . world up = ' + info.up[1].toFixed(3) + ')');
+  await shot(page, 'logo-on-fin');
+
+  console.log('20. colours: the lettering in cerise');
+  lettering = decalNamed(doc, 'lettering');
+  await clickSelector(page, '.layer-row[data-decal-id="' + lettering.id + '"] .swatch');
+  await clickSelector(page, '.popover .swatch[data-colour="#e64097"]');
+  doc = await documentOf(page);
+  check(decalNamed(doc, 'lettering').colourMap['#000000'] === '#e64097', 'the lettering is cut in cerise');
+
+  console.log('21. flip, duplicate, delete');
+  await clickSelector(page, '.layer-row[data-decal-id="' + lettering.id + '"] .tree-name');
+  await glide(page, canvas.x + canvas.width / 2, canvas.y + canvas.height - 30, 3);
+  await page.keyboard.press('h');
+  doc = await documentOf(page);
+  check(decalNamed(doc, 'lettering').flipX, 'H flips it');
+  await page.keyboard.press('h');
+  await page.keyboard.press('Control+d');
+  const copyAt = await screenOf(page, [tubeMiddleX + 30, 0, 0]);
+  await glide(page, copyAt.x, copyAt.y, 8);
+  await click(page, copyAt.x, copyAt.y);
+  doc = await documentOf(page);
+  check(doc.decals.length === 5 && doc.decals[doc.decals.length - 1].name === 'lettering copy', 'Ctrl+D makes a copy that follows the cursor and drops');
+  await glide(page, canvas.x + canvas.width / 2, canvas.y + canvas.height - 30, 3);
+  await page.keyboard.press('Delete');
+  doc = await documentOf(page);
+  check(doc.decals.length === 4, 'Delete removes the selected copy');
+
+  console.log('22. layers: reorder, hide, lock, rename');
+  const rows = page.locator('.layer-row');
+  check((await rows.count()) === 4, 'four layer rows');
+  // The lettering is the bottom layer (first placed): drag its row to the top.
+  const bottomRow = await page.locator('.layer-row[data-decal-id="' + lettering.id + '"] .tree-name').boundingBox();
+  const topRow = await page.locator('.layer-row').first().boundingBox();
+  if (bottomRow === null || topRow === null) {
+    throw new Error('no layer rows');
+  }
+  await glide(page, bottomRow.x + 20, bottomRow.y + bottomRow.height / 2, 2);
+  await page.mouse.down();
+  await glide(page, topRow.x + 20, topRow.y + 2, 8);
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+  doc = await documentOf(page);
+  check(doc.decals[doc.decals.length - 1].id === lettering.id, 'the lettering is now the top layer');
+  await clickSelector(page, '.layer-row[data-decal-id="' + stripe.id + '"] .eye');
+  const tubeLogo = decalNamed(doc, 'logo');
+  await clickSelector(page, '.layer-row[data-decal-id="' + tubeLogo.id + '"] .lock');
+  doc = await documentOf(page);
+  check(decalNamed(doc, 'stripe').hidden && decalNamed(doc, 'logo').locked, 'the band is hidden and the tube logo locked');
+  await page.keyboard.press('Escape');
+  const lockedInfo = await decalInfo(page, tubeLogo.id);
+  const lockedAt = await screenOf(page, lockedInfo.centre);
+  await click(page, lockedAt.x, lockedAt.y);
+  const selectedNow = await page.evaluate(function read() {
+    return window.dc6.selectedDecal();
+  });
+  check(selectedNow !== tubeLogo.id, 'a locked decal cannot be picked in the view');
+  await page.keyboard.press('Escape');
+  const finName = await page.locator('.layer-row[data-decal-id="' + finLogo.id + '"] .tree-name').boundingBox();
+  if (finName === null) {
+    throw new Error('no fin logo row');
+  }
+  await glide(page, finName.x + 10, finName.y + finName.height / 2, 2);
+  await page.mouse.dblclick(finName.x + 10, finName.y + finName.height / 2);
+  await page.waitForTimeout(100);
+  await page.keyboard.press('Control+a');
+  await page.keyboard.type('fin logo', { delay: 20 });
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(100);
+  doc = await documentOf(page);
+  check(doc.decals.some(function named(d) {
+    return d.name === 'fin logo';
+  }), 'the fin logo is renamed by double-click');
+  await shot(page, 'layers');
+
+  console.log('23. undo and redo decal edits');
+  await glide(page, canvas.x + canvas.width / 2, canvas.y + canvas.height - 30, 3);
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(80);
+  doc = await documentOf(page);
+  check(!doc.decals.some(function named(d) {
+    return d.name === 'fin logo';
+  }), 'undo takes the rename back');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(80);
+  doc = await documentOf(page);
+  check(!decalNamed(doc, 'logo').locked, 'undo again unlocks the logo');
+  await page.keyboard.press('Control+Shift+z');
+  await page.keyboard.press('Control+Shift+z');
+  await page.waitForTimeout(80);
+  doc = await documentOf(page);
+  check(decalNamed(doc, 'logo').locked && decalNamed(doc, 'fin logo').id === finLogo.id, 'redo puts both back');
+
+  console.log('24. export the cut file');
+  await clickSelector(page, 'button[data-control="export"]');
+  await shot(page, 'export-dialog');
+  await clickSelector(page, 'button[data-option="files:layers"]');
+  const downloadWaiting = page.waitForEvent('download');
+  await clickSelector(page, 'button[data-action="export"]');
+  const download = await downloadWaiting;
+  const file = readFileSync(await download.path(), 'utf8');
+  check(download.suggestedFilename() === 'dc6-cut.svg', 'one file with a layer per colour: ' + download.suggestedFilename());
+  const problems = plainSvgProblems(file);
+  check(problems.length === 0, 'the cut file is plain SVG in mm' + (problems.length > 0 ? ': ' + problems.join(', ') : ''));
+  check(/<text[^>]*>lettering<\/text>/.test(file) && /<text[^>]*>fin logo<\/text>/.test(file) && !/>stripe</.test(file), 'every shown decal is labelled; the hidden band is left out');
+  check(/<g id="cerise" inkscape:groupmode="layer"/.test(file) && /<g id="black" inkscape:groupmode="layer"/.test(file), 'a layer per vinyl colour');
+  // The lettering piece (45 x 15 mm) at 1:1: its paths span 45 mm.
+  const letteringPaths: string[] = [];
+  const pathPattern = /<path d="([^"]*)"/g;
+  let match = pathPattern.exec(file);
+  while (match !== null) {
+    letteringPaths.push(match[1]);
+    match = pathPattern.exec(file);
+  }
+  check(letteringPaths.length === 2 + 2 + 4, 'eight outlines: two logos of two shapes, four letter shapes (' + String(letteringPaths.length) + ')');
+  console.log('  cut file: ' + String(file.length) + ' bytes, first line of the svg: ' + (file.split('\n')[1] ?? '').slice(0, 150));
+  await clickSelector(page, 'button[data-control="export"]');
+  await clickSelector(page, 'button[data-option="files:per-colour"]');
+  const first = page.waitForEvent('download');
+  await clickSelector(page, 'button[data-action="export"]');
+  const cerise = await first;
+  const second = page.waitForEvent('download');
+  const black = await second;
+  check(cerise.suggestedFilename() === 'dc6-cut-cerise.svg' && black.suggestedFilename() === 'dc6-cut-black.svg', 'a file per colour: ' + cerise.suggestedFilename() + ', ' + black.suggestedFilename());
+  check(plainSvgProblems(readFileSync(await black.path(), 'utf8')).length === 0, 'the per-colour files are plain too');
+
+  console.log('25. the finished livery');
+  await page.keyboard.press('Escape');
+  await fitView(page);
+  await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 3);
+  await page.waitForTimeout(150);
+  await shot(page, 'livery-side');
+  await clickSelector(page, '.layer-row[data-decal-id="' + stripe.id + '"] .eye');
+  await clickSelector(page, 'button[data-view="top"]');
+  await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 3);
+  await page.waitForTimeout(150);
+  await shot(page, 'livery-top');
+  await fitView(page);
+  const jointClose = await screenOf(page, [tubeFore.centre[0] - 10, 0, 0]);
+  await glide(page, jointClose.x, jointClose.y, 3);
+  for (let k = 0; k < 14; k++) {
+    await page.mouse.wheel(0, -400);
+    await page.waitForTimeout(60);
+  }
+  await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 3);
+  await page.waitForTimeout(150);
+  await shot(page, 'livery-joint-close');
+  await fitView(page);
+  const orbitFrom = { x: canvas.x + canvas.width * 0.3, y: canvas.y + canvas.height * 0.9 };
+  await glide(page, orbitFrom.x, orbitFrom.y, 2);
+  await page.mouse.down();
+  await glide(page, orbitFrom.x + 200, orbitFrom.y - 70, 10);
+  await page.mouse.up();
+  await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 3);
+  await page.waitForTimeout(150);
+  await shot(page, 'livery-orbit');
+
+  console.log('26. place on face: the lettering centred on a fin side');
+  await fitView(page);
+  await clickSelector(page, '.layer-row[data-decal-id="' + lettering.id + '"] .tree-name');
+  await clickSelector(page, 'button[data-tool="face"]');
+  const finSide = await screenOf(page, side.centre);
+  await click(page, finSide.x, finSide.y);
+  doc = await documentOf(page);
+  lettering = decalNamed(doc, 'lettering');
+  check(lettering.anchor.placedId === frontFin.id && distance(lettering.anchor.position, side.centre) < 0.5, 'the lettering is centred on the fin face (' + distance(lettering.anchor.position, side.centre).toFixed(3) + ' mm off)');
+  info = await decalInfo(page, lettering.id);
+  check(info.up[1] > 0.5 && info.right[0] > 0.99, 'and stands upright there');
+  await clickSelector(page, 'button[data-tool="place"]');
+  await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 3);
+  await shot(page, 'lettering-placed-on-fin-face');
 }
 
 await main();

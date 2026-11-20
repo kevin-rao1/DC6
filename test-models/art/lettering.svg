@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DC6 test art: the letters "DC6" already converted to paths, 60 x 20 mm, black. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="60mm" height="20mm" viewBox="0 0 60 20">
+  <g fill="#000000" fill-rule="evenodd">
+    <path d="M0 0H8A10 10 0 0 1 8 20H0Z M4 4H8A6 6 0 0 1 8 16H4Z"/>
+    <path d="M38.07 2.93A10 10 0 1 0 38.07 17.07L35.24 14.24A6 6 0 1 1 35.24 5.76Z"/>
+    <path d="M60 14A6 6 0 1 1 48 14A6 6 0 1 1 60 14Z M56.5 14A2.5 2.5 0 1 0 51.5 14A2.5 2.5 0 1 0 56.5 14Z"/>
+    <polygon points="48,14 52,13.2 59,0 55,0"/>
+  </g>
+</svg>
