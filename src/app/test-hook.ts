@@ -9,6 +9,9 @@ import { requirePlaced, cloneDocument } from '../model/document.ts';
 import type { AssemblyDocument } from '../model/document.ts';
 import { applyToPoint } from '../geometry/transform.ts';
 import type { Vec3 } from '../geometry/vec3.ts';
+import type { PagePane } from './page-pane.ts';
+import { barycentricOf } from '../geometry/surface-mesh.ts';
+import { nearestOnPiece, pieceIndex } from '../geometry/geodesic.ts';
 
 export interface WorldFace {
   centre: Vec3;
@@ -44,6 +47,38 @@ export interface TestHook {
   decalMapTimes(): number[];
   // The mapped grid of a decal: rows of world points (null where absent).
   decalGrid(id: string): { columns: number; rows: number; xs: number[]; ys: number[]; points: Array<Vec3 | null> } | null;
+  // The flat page.
+  page(): PageInfo | null;
+  // Client positions on the page of a world point that is on a visible
+  // part's surface (one per place it shows), found from the nearest
+  // surface point of that part.
+  pageImagesOf(placedId: string, world: Vec3): Array<{ x: number; y: number; chart: number }>;
+  // The world point under a client position on the page.
+  pageWorldAt(x: number, y: number): Vec3 | null;
+  pageDecalCentres(id: string): Array<{ x: number; y: number }>;
+  pageHandles(): Array<{ handle: string; x: number; y: number }>;
+  // Client y of the strip's top and bottom (seam) edges at page x.
+  pageStripEdges(x: number): { top: number; bottom: number } | null;
+  // Is the page's own pointer point shown in 3D, and is the 3D pointer's
+  // point shown on the page.
+  linkedMarker3d(): boolean;
+  // Where the dot marking the page pointer's point is in 3D, or null.
+  linkedPoint3d(): Vec3 | null;
+  hoverPoint3d(): boolean;
+  viewRoll(): number;
+  pageDrawTimes(): number[];
+}
+
+export interface PageInfo {
+  stripTriangles: number;
+  stripLength: number;
+  islands: Array<{ label: string; placedId: string; kind: string; left: number; top: number; right: number; bottom: number }>;
+  buildMilliseconds: number;
+  zoom: number;
+  // Client position of page point (0, 0) (the nose tip on the strip's middle line).
+  originX: number;
+  originY: number;
+  canvas: { left: number; top: number; width: number; height: number };
 }
 
 export interface DecalInfo {
@@ -55,7 +90,7 @@ export interface DecalInfo {
   corners: Array<Vec3 | null>;
 }
 
-export function installTestHook(editor: Editor, importer: Importer, bundled: Promise<void>): void {
+export function installTestHook(editor: Editor, importer: Importer, bundled: Promise<void>, pagePane: PagePane): void {
   const hook: TestHook = {
     loaded: async function loaded(): Promise<void> {
       await bundled;
@@ -159,6 +194,69 @@ export function installTestHook(editor: Editor, importer: Importer, bundled: Pro
         }
       }
       return { columns: grid.columns, rows: grid.rows, xs: grid.xs, ys: grid.ys, points: points };
+    },
+    page: function page(): PageInfo | null {
+      const built = pagePane.page;
+      if (built === null) {
+        return null;
+      }
+      const boxes = pagePane.islandScreenBoxes();
+      const islands: PageInfo['islands'] = [];
+      for (let i = 0; i < boxes.length; i++) {
+        islands.push({ label: boxes[i].label, placedId: boxes[i].placedId, kind: built.islands[i].kind, left: boxes[i].left, top: boxes[i].top, right: boxes[i].right, bottom: boxes[i].bottom });
+      }
+      const origin = pagePane.toClient(0, 0);
+      const rect = pagePane.canvas.getBoundingClientRect();
+      return {
+        stripTriangles: built.strip.triangles.length,
+        stripLength: built.strip.length,
+        islands: islands,
+        buildMilliseconds: built.buildMilliseconds,
+        zoom: pagePane.zoom,
+        originX: origin.x,
+        originY: origin.y,
+        canvas: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      };
+    },
+    pageImagesOf: function pageImagesOf(placedId: string, world: Vec3) {
+      const surface = editor.decals.surfaceFor(editor.document);
+      const piece = pieceIndex(surface, placedId);
+      if (piece < 0) {
+        return [];
+      }
+      const at = nearestOnPiece(surface, piece, world, 2);
+      if (at === null) {
+        return [];
+      }
+      const w = barycentricOf(surface.pieces[piece].mesh, at.triangle, at.point);
+      return pagePane.screenImages(placedId, at.triangle, w);
+    },
+    pageWorldAt: function pageWorldAt(x: number, y: number): Vec3 | null {
+      return pagePane.worldAt(x, y);
+    },
+    pageDecalCentres: function pageDecalCentres(id: string) {
+      return pagePane.decalCentres(id);
+    },
+    pageHandles: function pageHandles() {
+      return pagePane.handleScreenPoints();
+    },
+    pageStripEdges: function pageStripEdges(x: number) {
+      return pagePane.stripEdgesAt(x);
+    },
+    linkedMarker3d: function linkedMarker3d(): boolean {
+      return pagePane.linkedHoverShown() > 0;
+    },
+    linkedPoint3d: function linkedPoint3d(): Vec3 | null {
+      return editor.linkedPoint;
+    },
+    hoverPoint3d: function hoverPoint3d(): boolean {
+      return editor.hoverPoint !== null;
+    },
+    viewRoll: function viewRoll(): number {
+      return editor.view.roll;
+    },
+    pageDrawTimes: function pageDrawTimes(): number[] {
+      return pagePane.drawTimes.slice();
     },
   };
   (window as unknown as { dc6: TestHook }).dc6 = hook;

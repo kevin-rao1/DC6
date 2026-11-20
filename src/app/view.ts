@@ -22,6 +22,12 @@ export class View {
   private beforeRender: Array<() => void> = [];
   // Time spent in the last few renders, for the e2e frame-rate check.
   readonly frameTimes: number[] = [];
+  // How far the camera is turned about the rocket axis from the presets
+  // (radians, from the side facing the side view towards the top). The flat
+  // page shows the side the camera faces along the middle of its strip, so
+  // rolling the page rolls this, and a preset view puts both back to 0.
+  roll = 0;
+  private readonly rollListeners: Array<() => void> = [];
 
   constructor(container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -60,7 +66,7 @@ export class View {
       self.requestRender();
     });
 
-    this.setPreset('side', [-150, 0, 0], 700);
+    this.setPreset('side', [-500, -100, -100], [200, 100, 100]);
     const resizeObserver = new ResizeObserver(function onResize() {
       self.resize();
     });
@@ -70,6 +76,42 @@ export class View {
 
   onBeforeRender(callback: () => void): void {
     this.beforeRender.push(callback);
+  }
+
+  onRoll(callback: () => void): void {
+    this.rollListeners.push(callback);
+  }
+
+  // Turn the camera (and its sense of up) about the rocket axis so that it
+  // faces the side at roll angle `angle`, as if the rocket were turned on
+  // its axis. Orbiting afterwards turns about that rolled up.
+  setRoll(angle: number): void {
+    const turn = angle - this.roll;
+    if (turn === 0) {
+      return;
+    }
+    const axis = new THREE.Vector3(NOSE_DIRECTION[0], NOSE_DIRECTION[1], NOSE_DIRECTION[2]);
+    const rotation = new THREE.Quaternion().setFromAxisAngle(axis, turn);
+    this.camera.position.applyQuaternion(rotation);
+    this.controls.target.applyQuaternion(rotation);
+    this.camera.up.applyQuaternion(rotation);
+    this.useCameraUp();
+    this.camera.lookAt(this.controls.target);
+    this.controls.update();
+    this.roll = angle;
+    for (let i = 0; i < this.rollListeners.length; i++) {
+      this.rollListeners[i]();
+    }
+    this.requestRender();
+  }
+
+  // The orbit controls keep the "up" they were made with in a private
+  // quaternion; when the camera's up changes it has to be told. (Doubt:
+  // this reaches into OrbitControls' internals, as of three 0.187.)
+  private useCameraUp(): void {
+    const internals = this.controls as unknown as { _quat: THREE.Quaternion; _quatInverse: THREE.Quaternion };
+    internals._quat.setFromUnitVectors(this.camera.up, new THREE.Vector3(0, 1, 0));
+    internals._quatInverse.copy(internals._quat).invert();
   }
 
   resize(): void {
@@ -109,9 +151,9 @@ export class View {
     });
   }
 
-  // Look at `centre` from a preset direction, from far enough to see `size` mm.
-  setPreset(preset: PresetView, centre: Vec3, size: number): void {
-    const distance = this.distanceToFit(size);
+  // Look at the box from min to max from a preset direction, from far
+  // enough to see all of it.
+  setPreset(preset: PresetView, min: Vec3, max: Vec3): void {
     let direction: Vec3 = [0, 0, 1];
     if (preset === 'side') {
       // From the side, a little above: the axis still runs straight across
@@ -127,10 +169,21 @@ export class View {
     } else {
       direction = [-NOSE_DIRECTION[0], -NOSE_DIRECTION[1], -NOSE_DIRECTION[2]];
     }
+    this.camera.up.set(WORLD_UP[0], WORLD_UP[1], WORLD_UP[2]);
+    this.useCameraUp();
+    const centre: Vec3 = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+    const towardsCamera = new THREE.Vector3(direction[0], direction[1], direction[2]).normalize();
+    const distance = this.distanceToFitBox(min, max, towardsCamera.clone().negate());
     this.controls.target.set(centre[0], centre[1], centre[2]);
     this.camera.position.set(centre[0] + direction[0] * distance, centre[1] + direction[1] * distance, centre[2] + direction[2] * distance);
     this.camera.lookAt(this.controls.target);
     this.controls.update();
+    if (this.roll !== 0) {
+      this.roll = 0;
+      for (let i = 0; i < this.rollListeners.length; i++) {
+        this.rollListeners[i]();
+      }
+    }
     this.requestRender();
   }
 
@@ -160,10 +213,11 @@ export class View {
     this.camera.updateProjectionMatrix();
   }
 
-  // Keep the current view direction, and frame `size` mm around `centre`.
-  fit(centre: Vec3, size: number): void {
+  // Keep the current view direction, and frame the box from min to max.
+  fit(min: Vec3, max: Vec3): void {
     const direction = this.viewDirection();
-    const distance = this.distanceToFit(size);
+    const centre: Vec3 = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+    const distance = this.distanceToFitBox(min, max, new THREE.Vector3(direction[0], direction[1], direction[2]));
     this.controls.target.set(centre[0], centre[1], centre[2]);
     this.camera.position.set(centre[0] - direction[0] * distance, centre[1] - direction[1] * distance, centre[2] - direction[2] * distance);
     this.camera.lookAt(this.controls.target);
@@ -171,13 +225,33 @@ export class View {
     this.requestRender();
   }
 
-  // Distance at which `size` mm fits the narrower of the two view angles.
-  private distanceToFit(size: number): number {
+  // Distance from the box's centre, looking along `forward` with the
+  // camera's up, at which the whole box fits the view: its extent across
+  // the screen against the horizontal view angle and its extent up the
+  // screen against the vertical one. (The view is wide and short now that
+  // the page is below it; fitting the box's diagonal left a long rocket
+  // small in the middle.)
+  private distanceToFitBox(min: Vec3, max: Vec3, forward: THREE.Vector3): number {
     const verticalAngle = (this.camera.fov * Math.PI) / 180;
     const aspect = Math.max(0.2, this.camera.aspect);
     const horizontalAngle = 2 * Math.atan(Math.tan(verticalAngle / 2) * aspect);
-    const fitAngle = Math.min(verticalAngle, horizontalAngle);
-    return (size / 2 / Math.tan(fitAngle / 2)) * 1.1;
+    const right = new THREE.Vector3().crossVectors(forward, this.camera.up).normalize();
+    const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+    let across = 0;
+    let upward = 0;
+    let depth = 0;
+    for (let corner = 0; corner < 8; corner++) {
+      const x = corner & 1 ? max[0] - min[0] : 0;
+      const y = corner & 2 ? max[1] - min[1] : 0;
+      const z = corner & 4 ? max[2] - min[2] : 0;
+      const offset = new THREE.Vector3(x - (max[0] - min[0]) / 2, y - (max[1] - min[1]) / 2, z - (max[2] - min[2]) / 2);
+      across = Math.max(across, Math.abs(offset.dot(right)));
+      upward = Math.max(upward, Math.abs(offset.dot(up)));
+      depth = Math.max(depth, Math.abs(offset.dot(forward)));
+    }
+    const forWidth = across / Math.tan(horizontalAngle / 2);
+    const forHeight = upward / Math.tan(verticalAngle / 2);
+    return Math.max(forWidth, forHeight) * 1.15 + depth;
   }
 
   // Ray through a point given in client (page) pixels.

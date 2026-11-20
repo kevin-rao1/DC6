@@ -261,6 +261,10 @@ function makeTube(): Shape {
   return hollowCylinder(body.outerRadius, body.outerRadius - body.wall, 0, tube.length);
 }
 
+function makeLongerTube(): Shape {
+  return hollowCylinder(body.outerRadius, body.outerRadius - body.wall, 0, tube.longerLength);
+}
+
 interface Thread {
   start: number; // z where the helix starts
   pitch: number;
@@ -616,6 +620,7 @@ const sledShape = makeSled();
 
 writeSingle('nose', noseShape);
 writeSingle('tube', tubeShape);
+writeSingle('tube-long', makeLongerTube());
 writeSingle('can', makeCan());
 writeSingle('boattail', boattailShape);
 writeSingle('fin', makeFinShape(fin));

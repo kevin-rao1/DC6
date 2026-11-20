@@ -50,6 +50,68 @@ button {
   inset: 0;
 }
 
+/* The window split: 3D view above, the flat page below. */
+.upper {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  overflow: hidden;
+}
+
+.lower {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+}
+
+.divider {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: row-resize;
+  z-index: 5;
+  touch-action: none;
+}
+
+.divider::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 1px;
+  background: var(--line);
+}
+
+.divider:hover::after,
+.divider.dragging::after {
+  top: 2px;
+  height: 2px;
+  background: var(--accent);
+}
+
+.page-pane {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.page-pane canvas {
+  display: block;
+  touch-action: none;
+}
+
+.page-fit {
+  position: absolute;
+  top: 26px;
+  right: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+
 .viewport canvas {
   display: block;
   outline: none;
@@ -82,7 +144,8 @@ button {
   color: var(--accent);
 }
 
-#app.dropping::after {
+#app.dropping::after,
+.upper.dropping::after {
   content: '';
   position: absolute;
   inset: 8px;

@@ -66,6 +66,14 @@ export interface DecalGrid {
   positions: Float64Array;
   normals: Float64Array;
   present: Uint8Array;
+  // Where each present point is on the surface, so the page can push the
+  // grid through its own map: surface piece number, triangle, and the
+  // point in that part's frame (3 numbers each).
+  pieces: Int32Array;
+  triangles: Int32Array;
+  locals: Float64Array;
+  // Placed id of each surface piece number.
+  placedIds: string[];
 }
 
 // Rotate v (perpendicular to unit n) by angle about n.
@@ -309,6 +317,13 @@ export function mapDecal(surface: Surface, frame: DecalFrame, width: number, hei
   const positions = new Float64Array(count * 3);
   const normals = new Float64Array(count * 3);
   const present = new Uint8Array(count);
+  const pieceOfPoint = new Int32Array(count);
+  const triangleOfPoint = new Int32Array(count);
+  const locals = new Float64Array(count * 3);
+  const placedIds: string[] = [];
+  for (let p = 0; p < surface.pieces.length; p++) {
+    placedIds.push(surface.pieces[p].placedId);
+  }
 
   const normal = worldNormal(surface, frame.at);
   const up = cross(normal, frame.right);
@@ -366,9 +381,26 @@ export function mapDecal(surface: Surface, frame: DecalFrame, width: number, hei
       normals[3 * index + 1] = smooth[1];
       normals[3 * index + 2] = smooth[2];
       present[index] = 1;
+      pieceOfPoint[index] = point.piece;
+      triangleOfPoint[index] = point.triangle;
+      locals[3 * index] = point.point[0];
+      locals[3 * index + 1] = point.point[1];
+      locals[3 * index + 2] = point.point[2];
     }
   }
-  return { columns: columns, rows: rows, xs: xs, ys: ys, positions: positions, normals: normals, present: present };
+  return {
+    columns: columns,
+    rows: rows,
+    xs: xs,
+    ys: ys,
+    positions: positions,
+    normals: normals,
+    present: present,
+    pieces: pieceOfPoint,
+    triangles: triangleOfPoint,
+    locals: locals,
+    placedIds: placedIds,
+  };
 }
 
 export function gridPoint(grid: DecalGrid, column: number, row: number): Vec3 | null {

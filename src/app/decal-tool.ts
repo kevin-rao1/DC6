@@ -10,6 +10,11 @@
 // The surface the decals walk on is every visible placed part (hidden parts
 // take no decals). Mapping is done with a coarse grid while something is
 // being dragged and the full grid when it is let go.
+//
+// The pointer can be in the 3D view or on the flat page. Both answer the
+// same questions (DecalPointer: which surface point, decal or handle is
+// under the pointer), so placing, sliding, turning and scaling a decal is
+// this one piece of code whichever view it is done in.
 
 import * as THREE from 'three';
 import type { Artwork } from '../geometry/artwork.ts';
@@ -39,7 +44,34 @@ const rotateHandleOffset = 26;
 // A press that moves less than this (CSS px) is a click.
 const clickSlop = 5;
 
-type Handle = 'scale' | 'rotate';
+export type Handle = 'scale' | 'rotate';
+
+// What a view tells the decal tool about the pointer (x, y: client pixels).
+export interface DecalPointer {
+  // On the page, sliding a decal off one island onto another moves it there
+  // (its anchor jumps to the other surface); in 3D it stops at the edge.
+  readonly jumps: boolean;
+  // The surface point under the pointer, on surfaceFor(document), or null.
+  surfaceUnder(x: number, y: number): SurfacePoint | null;
+  // The topmost pickable decal under the pointer, and the point in its own
+  // frame (mm from its centre).
+  decalUnder(x: number, y: number): { id: string; x: number; y: number } | null;
+  handleUnder(x: number, y: number): Handle | null;
+  // The world direction a new decal's right takes here, so it is upright as
+  // this view shows it; null for the default (artwork up is world up).
+  rightAt(x: number, y: number): Vec3 | null;
+  // The selected decal's plane as this view shows it, when a handle drag
+  // begins at (x, y): it turns pointer positions into mm along the decal's
+  // right and up from its centre.
+  planeOf(decalId: string, frame: DecalFrame, x: number, y: number): DecalPlane | null;
+  // The distance or angle beside the cursor during a handle drag.
+  showLabel(x: number, y: number, text: string): void;
+  hideLabel(): void;
+}
+
+export interface DecalPlane {
+  coordinates(x: number, y: number): [number, number] | null;
+}
 
 interface Held {
   artworkId: string;
@@ -49,6 +81,7 @@ interface Held {
 }
 
 interface Drag {
+  pointer: DecalPointer;
   decalId: string;
   before: AssemblyDocument;
   start: Decal;
@@ -64,17 +97,15 @@ interface Drag {
 }
 
 interface HandleDrag {
+  pointer: DecalPointer;
   handle: Handle;
   decalId: string;
   before: AssemblyDocument;
   start: Decal;
-  // The decal's tangent plane at its anchor, when the drag began.
-  centre: Vec3;
-  normal: Vec3;
-  right: Vec3;
-  up: Vec3;
-  // The cursor's point on that plane when the drag began.
-  from: Vec3;
+  // The decal's plane when the drag began, and where the cursor was on it
+  // (mm along the decal's right and up from its centre).
+  plane: DecalPlane;
+  from: [number, number];
   latest: Partial<NewDecal> | null;
 }
 
@@ -104,6 +135,10 @@ export class DecalTool {
   // Milliseconds per decal re-map while dragging (for the e2e report).
   readonly mapTimes: number[] = [];
   private shift = false;
+  // The 3D view as a pointer source.
+  readonly view3d: DecalPointer;
+  // The grid of the decal being held, for the page to draw too.
+  heldGrid: DecalGrid | null = null;
 
   constructor(editor: Editor, labelParent: HTMLElement) {
     this.editor = editor;
@@ -113,6 +148,39 @@ export class DecalTool {
     this.label.className = 'decal-label';
     labelParent.appendChild(this.label);
     const self = this;
+    this.view3d = {
+      jumps: false,
+      surfaceUnder: function surfaceUnder(x: number, y: number): SurfacePoint | null {
+        return self.surfaceUnder3d(x, y);
+      },
+      decalUnder: function decalUnder(x: number, y: number) {
+        return self.decalUnder(x, y);
+      },
+      handleUnder: function handleUnder(x: number, y: number): Handle | null {
+        return self.handleUnder(x, y);
+      },
+      // In 3D a new decal stands upright in the world (see defaultUp).
+      rightAt: function rightAt(): Vec3 | null {
+        return null;
+      },
+      // (The 3D plane is the decal's tangent plane; which decal is in the frame.)
+      planeOf: function planeOf(_decalId: string, frame: DecalFrame): DecalPlane | null {
+        return self.plane3d(frame);
+      },
+      showLabel: function showLabel(x: number, y: number, text: string): void {
+        self.label.textContent = text;
+        self.label.style.display = 'block';
+        const parent = self.label.parentElement;
+        if (parent !== null) {
+          const rect = parent.getBoundingClientRect();
+          self.label.style.left = String(x - rect.left + 16) + 'px';
+          self.label.style.top = String(y - rect.top + 14) + 'px';
+        }
+      },
+      hideLabel: function hideLabel(): void {
+        self.label.style.display = 'none';
+      },
+    };
     // The handles keep a constant size on screen, so they follow the camera.
     editor.view.onBeforeRender(function placeHandles() {
       self.updateHandles();
@@ -316,6 +384,7 @@ export class DecalTool {
   private syncHeld(doc: AssemblyDocument): void {
     const held = this.held;
     if (held === null || held.frame === null) {
+      this.heldGrid = null;
       if (this.heldVisual !== null) {
         this.heldVisual.mesh.visible = false;
       }
@@ -328,10 +397,19 @@ export class DecalTool {
     const settings = this.heldSettings(held);
     const surface = this.surfaceFor(doc);
     const grid = this.timedMap(surface, held.frame, settings.width, settings.height, false);
+    this.heldGrid = grid;
     this.heldVisual.setGrid(grid, settings.width, settings.height, settings.flipX, settings.flipY, '');
     this.dressVisual(this.heldVisual, held.artworkId, settings.colourMap, settings.width, settings.height);
     this.heldVisual.setLayer(doc.decals.length);
     this.heldVisual.mesh.visible = true;
+  }
+
+  // The settings of the decal being held, or null.
+  heldSettingsNow(): NewDecal | null {
+    if (this.held === null) {
+      return null;
+    }
+    return this.heldSettings(this.held);
   }
 
   private heldSettings(held: Held): NewDecal {
@@ -510,8 +588,13 @@ export class DecalTool {
     return best;
   }
 
-  // Where the cursor ray meets the surface (visible parts), or null.
-  private surfaceUnder(clientX: number, clientY: number): SurfacePoint | null {
+  // Where the cursor ray meets the surface (visible parts), or null; null
+  // off the 3D view (over the page, say).
+  surfaceUnder3d(clientX: number, clientY: number): SurfacePoint | null {
+    const rect = this.editor.view.canvas.getBoundingClientRect();
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+      return null;
+    }
     const ray = this.editor.view.rayAt(clientX, clientY);
     const surface = this.surfaceFor(this.editor.document);
     const hit = raycastSurface(surface, ray.origin, ray.direction);
@@ -522,21 +605,21 @@ export class DecalTool {
   }
 
   // The cursor shape over the 3D view, or null if decals have nothing to say.
-  cursorAt(clientX: number, clientY: number): string | null {
+  cursorAt(pointer: DecalPointer, clientX: number, clientY: number): string | null {
     if (this.held !== null || this.drag !== null) {
       return 'grabbing';
     }
     if (this.handleDrag !== null) {
       return this.handleDrag.handle === 'scale' ? 'nwse-resize' : 'grabbing';
     }
-    const handle = this.handleUnder(clientX, clientY);
+    const handle = pointer.handleUnder(clientX, clientY);
     if (handle === 'scale') {
       return 'nwse-resize';
     }
     if (handle === 'rotate') {
       return 'grab';
     }
-    if (this.decalUnder(clientX, clientY) !== null) {
+    if (pointer.decalUnder(clientX, clientY) !== null) {
       return 'move';
     }
     return null;
@@ -576,35 +659,41 @@ export class DecalTool {
       return false;
     }
     this.held = null;
+    this.heldGrid = null;
     this.editor.redraw();
     return true;
   }
 
   // Follow the cursor: stuck to the surface under it at true size, upright.
-  updateHeld(clientX: number, clientY: number): void {
+  updateHeld(pointer: DecalPointer, clientX: number, clientY: number): void {
     const held = this.held;
     if (held === null) {
       return;
     }
-    const at = this.surfaceUnder(clientX, clientY);
+    const at = pointer.surfaceUnder(clientX, clientY);
     held.frame = null;
     if (at !== null) {
       const surface = this.surfaceFor(this.editor.document);
       const normal = worldNormal(surface, at);
       const rotation = held.template === null ? 0 : held.template.rotation;
-      held.frame = frameAt(surface, at, rotateInPlane(defaultRight(normal), normal, rotation));
+      let right = rotateInPlane(defaultRight(normal), normal, rotation);
+      const viewRight = pointer.rightAt(clientX, clientY);
+      if (held.template === null && viewRight !== null) {
+        right = viewRight;
+      }
+      held.frame = frameAt(surface, at, right);
     }
     this.syncHeld(this.editor.shownDocument);
     this.editor.view.requestRender();
   }
 
   // Click: drop the held decal where it is.
-  dropHeld(clientX: number, clientY: number): void {
+  dropHeld(pointer: DecalPointer, clientX: number, clientY: number): void {
     const held = this.held;
     if (held === null) {
       return;
     }
-    this.updateHeld(clientX, clientY);
+    this.updateHeld(pointer, clientX, clientY);
     if (held.frame === null) {
       return; // not over the rocket: keep holding
     }
@@ -615,6 +704,25 @@ export class DecalTool {
     settings.rotation = stored.rotation;
     const added = addDecal(this.editor.document, settings);
     this.held = null;
+    this.heldGrid = null;
+    this.selectedId = added.id;
+    this.editor.commitDocument(added.doc, null);
+  }
+
+  // A new decal of this artwork at a surface point (an SVG file dropped
+  // onto the page), with its right along `right` (null: the default).
+  placeArtworkAt(artworkId: string, at: SurfacePoint, right: Vec3 | null): void {
+    const surface = this.surfaceFor(this.editor.document);
+    const normal = worldNormal(surface, at);
+    const frame = frameAt(surface, at, right === null ? defaultRight(normal) : right);
+    if (frame === null) {
+      return;
+    }
+    const stored = anchorOf(surface, frame);
+    const settings = this.heldSettings({ artworkId: artworkId, template: null, frame: frame });
+    settings.anchor = stored.anchor;
+    settings.rotation = stored.rotation;
+    const added = addDecal(this.editor.document, settings);
     this.selectedId = added.id;
     this.editor.commitDocument(added.doc, null);
   }
@@ -622,23 +730,24 @@ export class DecalTool {
   // ---------------------------------------------------------------------------
   // Pressing, dragging, letting go.
 
-  // A press in the 3D view. Returns true if it belongs to the decals.
-  pointerDown(clientX: number, clientY: number): boolean {
+  // A press in a view. Returns true if it belongs to the decals.
+  pointerDown(pointer: DecalPointer, clientX: number, clientY: number): boolean {
     if (this.held !== null) {
       return true; // the release drops it
     }
-    const handle = this.handleUnder(clientX, clientY);
+    const handle = pointer.handleUnder(clientX, clientY);
     if (handle !== null && this.selectedId !== null) {
-      this.startHandleDrag(handle, clientX, clientY);
+      this.startHandleDrag(pointer, handle, clientX, clientY);
       return this.handleDrag !== null;
     }
-    const under = this.decalUnder(clientX, clientY);
+    const under = pointer.decalUnder(clientX, clientY);
     if (under === null) {
       return false;
     }
     this.select(under.id);
     const decal = requireDecal(this.editor.document, under.id);
     this.drag = {
+      pointer: pointer,
       decalId: under.id,
       before: this.editor.document,
       start: JSON.parse(JSON.stringify(decal)) as Decal,
@@ -653,18 +762,20 @@ export class DecalTool {
     return true;
   }
 
-  pointerMove(clientX: number, clientY: number, shift: boolean): void {
+  pointerMove(pointer: DecalPointer, clientX: number, clientY: number, shift: boolean): void {
     this.shift = shift;
     if (this.held !== null) {
-      this.updateHeld(clientX, clientY);
+      this.updateHeld(pointer, clientX, clientY);
       return;
     }
     if (this.handleDrag !== null) {
-      this.updateHandleDrag(clientX, clientY);
+      if (this.handleDrag.pointer === pointer) {
+        this.updateHandleDrag(clientX, clientY);
+      }
       return;
     }
     const drag = this.drag;
-    if (drag === null) {
+    if (drag === null || drag.pointer !== pointer) {
       return;
     }
     if (!drag.moved) {
@@ -677,10 +788,10 @@ export class DecalTool {
   }
 
   // Returns true if the release belonged to the decals.
-  pointerUp(clientX: number, clientY: number, overCanvas: boolean): boolean {
+  pointerUp(pointer: DecalPointer, clientX: number, clientY: number, overCanvas: boolean): boolean {
     if (this.held !== null) {
       if (overCanvas) {
-        this.dropHeld(clientX, clientY);
+        this.dropHeld(pointer, clientX, clientY);
       }
       return true;
     }
@@ -719,7 +830,7 @@ export class DecalTool {
       return;
     }
     const surface = this.surfaceFor(drag.before);
-    const at = this.surfaceUnder(clientX, clientY);
+    const at = drag.pointer.surfaceUnder(clientX, clientY);
     if (at === null) {
       return; // off the rocket: the decal stays where it last was
     }
@@ -733,9 +844,21 @@ export class DecalTool {
       const atGrab = walkFrame(surface, startFrame, drag.grabX, drag.grabY);
       previous = atGrab === null ? startFrame : atGrab;
     }
-    const cursorFrame = followCursor(surface, previous, at);
+    let cursorFrame = followCursor(surface, previous, at);
     if (cursorFrame === null) {
       return;
+    }
+    // On the page the pointer can go where no walk along the surface leads
+    // (onto another island, or round the rocket in one move): the decal
+    // goes there, keeping its angle from upright.
+    const missedBy = length(sub(worldPoint(surface, cursorFrame.at), worldPoint(surface, at)));
+    if (drag.pointer.jumps && missedBy > 1) {
+      const normal = worldNormal(surface, at);
+      const latestRotation = drag.latest === null ? drag.start.rotation : drag.latest.rotation;
+      const jumped = frameAt(surface, at, rotateInPlane(defaultRight(normal), normal, latestRotation));
+      if (jumped !== null) {
+        cursorFrame = jumped;
+      }
     }
     drag.cursor = cursorFrame;
     // From the cursor back to the decal's centre.
@@ -748,7 +871,7 @@ export class DecalTool {
     this.editor.previewDocument(updateDecal(drag.before, drag.decalId, drag.latest));
   }
 
-  private startHandleDrag(handle: Handle, clientX: number, clientY: number): void {
+  private startHandleDrag(pointer: DecalPointer, handle: Handle, clientX: number, clientY: number): void {
     if (this.selectedId === null) {
       return;
     }
@@ -759,23 +882,43 @@ export class DecalTool {
     if (frame === null) {
       return;
     }
-    const centre = worldPoint(surface, frame.at);
-    const normal = worldNormal(surface, frame.at);
-    const from = this.onPlane(clientX, clientY, centre, normal);
+    const plane = pointer.planeOf(decal.id, frame, clientX, clientY);
+    if (plane === null) {
+      return;
+    }
+    const from = plane.coordinates(clientX, clientY);
     if (from === null) {
       return;
     }
     this.handleDrag = {
+      pointer: pointer,
       handle: handle,
       decalId: decal.id,
       before: doc,
       start: JSON.parse(JSON.stringify(decal)) as Decal,
-      centre: centre,
-      normal: normal,
-      right: frame.right,
-      up: upOf(surface, frame),
+      plane: plane,
       from: from,
       latest: null,
+    };
+  }
+
+  // The decal's tangent plane at its anchor, seen through the 3D view.
+  private plane3d(frame: DecalFrame): DecalPlane | null {
+    const surface = this.surfaceFor(this.editor.document);
+    const centre = worldPoint(surface, frame.at);
+    const normal = worldNormal(surface, frame.at);
+    const right = frame.right;
+    const up = upOf(surface, frame);
+    const self = this;
+    return {
+      coordinates: function coordinates(x: number, y: number): [number, number] | null {
+        const onPlane = self.onPlane(x, y, centre, normal);
+        if (onPlane === null) {
+          return null;
+        }
+        const offset = sub(onPlane, centre);
+        return [dot(offset, right), dot(offset, up)];
+      },
     };
   }
 
@@ -795,20 +938,20 @@ export class DecalTool {
     if (drag === null) {
       return;
     }
-    const now = this.onPlane(clientX, clientY, drag.centre, drag.normal);
+    const now = drag.plane.coordinates(clientX, clientY);
     if (now === null) {
       return;
     }
-    const startOffset = sub(drag.from, drag.centre);
-    const offset = sub(now, drag.centre);
+    const startOffset = drag.from;
+    const offset = now;
     let text = '';
     if (drag.handle === 'scale') {
       // Uniform, about the centre: the corner follows the cursor's distance.
-      const startDistance = length(startOffset);
+      const startDistance = Math.hypot(startOffset[0], startOffset[1]);
       if (startDistance < 1e-6) {
         return;
       }
-      let factor = length(offset) / startDistance;
+      let factor = Math.hypot(offset[0], offset[1]) / startDistance;
       const smallest = 1 / Math.min(drag.start.width, drag.start.height);
       factor = Math.max(factor, smallest);
       const width = drag.start.width * factor;
@@ -816,8 +959,8 @@ export class DecalTool {
       drag.latest = { width: width, height: height };
       text = width.toFixed(1) + ' × ' + height.toFixed(1) + ' mm';
     } else {
-      const startAngle = Math.atan2(dot(startOffset, drag.up), dot(startOffset, drag.right));
-      const angle = Math.atan2(dot(offset, drag.up), dot(offset, drag.right));
+      const startAngle = Math.atan2(startOffset[1], startOffset[0]);
+      const angle = Math.atan2(offset[1], offset[0]);
       let rotation = drag.start.rotation + (angle - startAngle);
       if (!this.shift) {
         const step = (15 * Math.PI) / 180;
@@ -826,20 +969,16 @@ export class DecalTool {
       drag.latest = { rotation: rotation };
       text = formatDegrees((rotation * 180) / Math.PI);
     }
-    this.label.textContent = text;
-    this.label.style.display = 'block';
-    const rect = this.label.parentElement === null ? null : this.label.parentElement.getBoundingClientRect();
-    if (rect !== null) {
-      this.label.style.left = String(clientX - rect.left + 16) + 'px';
-      this.label.style.top = String(clientY - rect.top + 14) + 'px';
-    }
+    drag.pointer.showLabel(clientX, clientY, text);
     this.editor.previewDocument(updateDecal(drag.before, drag.decalId, drag.latest));
   }
 
   private finishHandleDrag(): void {
     const drag = this.handleDrag;
     this.handleDrag = null;
-    this.label.style.display = 'none';
+    if (drag !== null) {
+      drag.pointer.hideLabel();
+    }
     if (drag === null || drag.latest === null) {
       this.editor.redraw();
       return;
@@ -864,9 +1003,11 @@ export class DecalTool {
       return true;
     }
     if (this.drag !== null || this.handleDrag !== null) {
+      if (this.handleDrag !== null) {
+        this.handleDrag.pointer.hideLabel();
+      }
       this.drag = null;
       this.handleDrag = null;
-      this.label.style.display = 'none';
       this.editor.redraw();
       return true;
     }

@@ -1,4 +1,4 @@
-// End-to-end check of stages 1 to 3, driving the built app with real mouse events
+// End-to-end check of stages 1 to 4, driving the built app with real mouse events
 // (page.mouse move/down/up and real key presses; nothing is placed by calling
 // the editor). window.dc6 is only used to find where things are on screen and
 // to read the resulting document.
@@ -15,7 +15,8 @@
 // The fins are dropped 40 degrees above the side and snap to 45 (15 degree
 // roll steps from straight up).
 //
-// Then decals (stage 2) and the cut file (stage 3): see decalSteps below.
+// Then decals (stage 2) and the cut file (stage 3): see decalSteps below;
+// then the flat page linked to 3D (stage 4): see pageSteps.
 
 import { preview } from 'vite';
 import { mkdirSync } from 'node:fs';
@@ -25,7 +26,7 @@ import type { Page, Playwright } from './playwright-types.ts';
 import { readFileSync } from 'node:fs';
 import type { DecalInfo } from '../src/app/test-hook.ts';
 import type { AssemblyDocument, PlacedPart } from '../src/model/document.ts';
-import type { TestHook, WorldFace } from '../src/app/test-hook.ts';
+import type { PageInfo, TestHook, WorldFace } from '../src/app/test-hook.ts';
 import type { Vec3 } from '../src/geometry/vec3.ts';
 import { body, can } from './test-model-dimensions.ts';
 
@@ -516,6 +517,7 @@ async function main(): Promise<void> {
       check(Math.abs(spacing - 90) < 1e-6, 'neighbouring fins are 90 degrees apart (' + spacing.toFixed(6) + ')');
     }
     await decalSteps(page, names, canvas);
+    await pageSteps(page, names);
 
     const frameTimes = await page.evaluate(function times() {
       return window.dc6.frameTimes();
@@ -1072,6 +1074,375 @@ async function decalSteps(page: Page, names: Record<string, string>, canvas: { x
   await clickSelector(page, 'button[data-tool="place"]');
   await glide(page, canvas.x + 5, canvas.y + canvas.height - 5, 3);
   await shot(page, 'lettering-placed-on-fin-face');
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: the flat page, linked to 3D.
+
+async function pageInfo(page: Page): Promise<PageInfo> {
+  const info = await page.evaluate(function read() {
+    return window.dc6.page();
+  });
+  if (info === null) {
+    throw new Error('no page');
+  }
+  return info;
+}
+
+async function pageWorldAt(page: Page, x: number, y: number): Promise<Vec3 | null> {
+  return page.evaluate(function read(p: { x: number; y: number }) {
+    return window.dc6.pageWorldAt(p.x, p.y);
+  }, { x: x, y: y });
+}
+
+async function pageImagesOf(page: Page, placedId: string, world: Vec3): Promise<Array<{ x: number; y: number; chart: number }>> {
+  return page.evaluate(function read(a: { id: string; world: Vec3 }) {
+    return window.dc6.pageImagesOf(a.id, a.world);
+  }, { id: placedId, world: world });
+}
+
+async function pageCentres(page: Page, id: string): Promise<Array<{ x: number; y: number }>> {
+  return page.evaluate(function read(decalId: string) {
+    return window.dc6.pageDecalCentres(decalId);
+  }, id);
+}
+
+function rollOf(p: Vec3): number {
+  return Math.atan2(p[1], p[2]);
+}
+
+// Drag with the mouse in small steps, as a hand would.
+async function dragFrom(page: Page, from: { x: number; y: number }, to: { x: number; y: number }, steps: number): Promise<void> {
+  await glide(page, from.x, from.y, 3);
+  await page.mouse.down();
+  await glide(page, to.x, to.y, steps);
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+}
+
+async function pageSteps(page: Page, names: Record<string, string>): Promise<void> {
+  let doc = await documentOf(page);
+  const tube = one(doc, names, 'tube');
+  const sled = one(doc, names, 'sled');
+
+  console.log('27. the flat page: the strip and the fin islands');
+  // The sled was put back floating above the rocket by the redo in step 9:
+  // hide it again, as the rocket would be built.
+  if (!sled.hidden) {
+    await clickSelector(page, '.tree-row[data-placed-id="' + sled.id + '"] .eye');
+  }
+  await page.keyboard.press('Escape');
+  await fitView(page);
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  await page.waitForTimeout(300);
+  let info = await pageInfo(page);
+  const finIslands = info.islands.filter(function onFin(i) {
+    return names[(doc.placed.find((p) => p.id === i.placedId) as PlacedPart).partId] === 'fin';
+  });
+  check(info.stripTriangles > 1000 && Math.abs(info.stripLength - 493.8) < 2, 'the page has one body strip, ' + info.stripLength.toFixed(1) + ' mm from nose tip to tail (' + String(info.stripTriangles) + ' triangles)');
+  check(finIslands.length === 8 && info.islands.length === 8, 'eight fin side islands and nothing else (' + info.islands.map((i) => i.label).join(', ') + ')');
+  console.log('  page built in ' + info.buildMilliseconds.toFixed(0) + ' ms in the browser');
+  await glide(page, info.canvas.left + 5, info.canvas.top + info.canvas.height - 5, 2);
+  await shot(page, 'page');
+
+  console.log('28. hover: a point on the page is marked in 3D, a point in 3D on the page');
+  const onStrip = { x: info.originX + 260 * info.zoom, y: info.originY - 10 * info.zoom };
+  await glide(page, onStrip.x, onStrip.y, 6);
+  const underPage = await pageWorldAt(page, onStrip.x, onStrip.y);
+  const marker = await page.evaluate(function read() {
+    return window.dc6.linkedPoint3d();
+  });
+  check(underPage !== null && marker !== null && distance(underPage, marker) < 0.01, 'hovering the strip puts the 3D marker on the same surface point (' + JSON.stringify(underPage) + ' / ' + JSON.stringify(marker) + ')');
+  await shot(page, 'hover-page');
+  const tubeFaces = await faces(page, tube.id);
+  const tubeAft = faceFacing(tubeFaces, body.outerRadius, 1);
+  const spot3d: Vec3 = [tubeAft.centre[0] - 150, body.outerRadius * Math.sin(0.3), body.outerRadius * Math.cos(0.3)];
+  const spotScreen = await screenOf(page, spot3d);
+  await glide(page, spotScreen.x, spotScreen.y, 8);
+  await page.waitForTimeout(100);
+  const shownOnPage = await page.evaluate(function read() {
+    return window.dc6.hoverPoint3d();
+  });
+  const spotImages = await pageImagesOf(page, tube.id, spot3d);
+  check(shownOnPage && spotImages.length === 1, 'hovering the tube in 3D marks the point on the page (at ' + spotImages.map((p) => p.x.toFixed(0) + ',' + p.y.toFixed(0)).join(' ') + ')');
+  await shot(page, 'hover-3d');
+
+  console.log('29. drop a decal from the bin onto the strip');
+  info = await pageInfo(page);
+  const dropAt = { x: info.originX + 230 * info.zoom, y: info.originY - 5 * info.zoom };
+  await clickSelector(page, '.art-item[data-artwork-name="logo"]');
+  await glide(page, dropAt.x, dropAt.y, 14);
+  await click(page, dropAt.x, dropAt.y);
+  doc = await documentOf(page);
+  const pageLogo = doc.decals[doc.decals.length - 1];
+  const dropWorld = await pageWorldAt(page, dropAt.x, dropAt.y);
+  check(pageLogo.anchor.placedId === tube.id && dropWorld !== null && distance(pageLogo.anchor.position, dropWorld) < 0.01, 'clicked on the page, the logo is stuck to the tube at that point');
+
+  console.log('30. drag it on the page: the 3D decal moves to the matching place');
+  let centres = await pageCentres(page, pageLogo.id);
+  const target = { x: centres[0].x + 40, y: centres[0].y + 25 };
+  await dragFrom(page, centres[0], target, 14);
+  const targetWorld = await pageWorldAt(page, target.x, target.y);
+  let logoInfo = await decalInfo(page, pageLogo.id);
+  check(targetWorld !== null && distance(logoInfo.centre, targetWorld) < 0.6, 'the 3D decal centre is where the page shows it (' + (targetWorld === null ? 'none' : distance(logoInfo.centre, targetWorld).toFixed(3)) + ' mm off)');
+  const moveAlong = Number(await page.locator('.adjust input[data-field="along"]').first().inputValue());
+  check(moveAlong > 5, 'the adjust panel offers the page move as a decal move (along ' + moveAlong + ' mm)');
+  await shot(page, 'page-drag');
+
+  console.log('31. drag it in 3D: the page follows');
+  const before3d = await screenOf(page, logoInfo.centre);
+  await dragFrom(page, before3d, { x: before3d.x - 60, y: before3d.y + 10 }, 12);
+  logoInfo = await decalInfo(page, pageLogo.id);
+  const expected = await pageImagesOf(page, tube.id, logoInfo.centre);
+  centres = await pageCentres(page, pageLogo.id);
+  check(expected.length > 0 && centres.length > 0 && Math.hypot(centres[0].x - expected[0].x, centres[0].y - expected[0].y) < 1.5, 'the page shows the decal at its new 3D place');
+
+  console.log('32. rotate and scale it with the page handles');
+  // Click it on the page to select it there.
+  await click(page, centres[0].x, centres[0].y);
+  let pageHandleList = await page.evaluate(function read() {
+    return window.dc6.pageHandles();
+  });
+  const rotateHandle = pageHandleList.filter((h) => h.handle === 'rotate')[0];
+  check(rotateHandle !== undefined && pageHandleList.length === 5, 'the page shows four corner handles and a rotate handle (' + pageHandleList.map((h) => h.handle).join(', ') + ')');
+  doc = await documentOf(page);
+  const before = doc.decals.find((d) => d.id === pageLogo.id) as AssemblyDocument['decals'][number];
+  const centre = centres[0];
+  const radius = Math.hypot(rotateHandle.x - centre.x, rotateHandle.y - centre.y);
+  const startAngle = Math.atan2(rotateHandle.y - centre.y, rotateHandle.x - centre.x);
+  await glide(page, rotateHandle.x, rotateHandle.y, 3);
+  await page.mouse.down();
+  for (let k = 1; k <= 10; k++) {
+    const a = startAngle - ((47 * Math.PI) / 180) * (k / 10);
+    await page.mouse.move(centre.x + radius * Math.cos(a), centre.y + radius * Math.sin(a));
+    await page.waitForTimeout(20);
+  }
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+  doc = await documentOf(page);
+  let after = doc.decals.find((d) => d.id === pageLogo.id) as AssemblyDocument['decals'][number];
+  const turned = ((after.rotation - before.rotation) * 180) / Math.PI;
+  check(Math.abs(turned - 45) < 1e-6, 'turning the page handle 47 degrees anticlockwise turns it 45 (snapped): ' + turned.toFixed(3));
+  pageHandleList = await page.evaluate(function read() {
+    return window.dc6.pageHandles();
+  });
+  const corner = pageHandleList.filter((h) => h.handle === 'scale')[0];
+  await dragFrom(page, corner, { x: centre.x + (corner.x - centre.x) * 1.5, y: centre.y + (corner.y - centre.y) * 1.5 }, 10);
+  doc = await documentOf(page);
+  after = doc.decals.find((d) => d.id === pageLogo.id) as AssemblyDocument['decals'][number];
+  const grew = after.width / before.width;
+  check(grew > 1.35 && grew < 1.65 && Math.abs(after.width / after.height - before.width / before.height) < 1e-6, 'the page corner scales it uniformly by ' + grew.toFixed(3));
+  await shot(page, 'page-handles');
+
+  console.log('33. drag it across the seam on the page');
+  centres = await pageCentres(page, pageLogo.id);
+  let edges = await page.evaluate(function read() {
+    return window.dc6.pageStripEdges(240);
+  });
+  if (edges === null) {
+    throw new Error('no strip edges');
+  }
+  const pastSeam = { x: centres[0].x, y: edges.top - 4 };
+  await dragFrom(page, centres[0], pastSeam, 20);
+  logoInfo = await decalInfo(page, pageLogo.id);
+  centres = await pageCentres(page, pageLogo.id);
+  const roll = (rollOf(logoInfo.centre) * 180) / Math.PI;
+  // Past the top edge the page shows the surface just round the seam, at
+  // roll angles from -180 degrees on.
+  check(roll < -150 && centres.length >= 2, 'dragged past the strip edge it went round the back (roll ' + roll.toFixed(1) + ' deg) and shows on both sides of the seam (' + String(centres.length) + ' drawings)');
+  await shot(page, 'page-across-seam');
+
+  console.log('34. pan the page down to bring the seam to the middle: the strip repeats');
+  info = await pageInfo(page);
+  const emptyLeft = { x: info.originX - 60, y: info.canvas.top + info.canvas.height / 2 };
+  const middleY = info.canvas.top + 20 + (info.canvas.height - 20) / 2;
+  const drawsBefore = (await page.evaluate(function read() {
+    return window.dc6.pageDrawTimes();
+  })).length;
+  await dragFrom(page, emptyLeft, { x: emptyLeft.x, y: emptyLeft.y + (middleY - edges.top) }, 12);
+  const panDraws = await page.evaluate(function read() {
+    return window.dc6.pageDrawTimes();
+  });
+  const duringPan = panDraws.slice(drawsBefore);
+  let panTotal = 0;
+  for (let i = 0; i < duringPan.length; i++) {
+    panTotal = panTotal + duringPan[i];
+  }
+  console.log('  page redraw while panning: mean ' + (panTotal / Math.max(1, duringPan.length)).toFixed(1) + ' ms over ' + String(duringPan.length) + ' draws');
+  edges = await page.evaluate(function read() {
+    return window.dc6.pageStripEdges(240);
+  });
+  info = await pageInfo(page);
+  if (edges === null) {
+    throw new Error('no strip edges');
+  }
+  const seamX = info.originX + 240 * info.zoom;
+  const belowSeam = await pageWorldAt(page, seamX, edges.top + 6);
+  const aboveSeam = await pageWorldAt(page, seamX, edges.top - 6);
+  check(Math.abs(edges.top - middleY) < 3, 'the seam is in the middle of the page (' + edges.top.toFixed(1) + ' / ' + middleY.toFixed(1) + ')');
+  check(belowSeam !== null && aboveSeam !== null && Math.abs(rollOf(belowSeam)) > 2.5 && Math.abs(rollOf(aboveSeam)) > 2.5 && rollOf(belowSeam) * rollOf(aboveSeam) < 0, 'above the seam the strip goes on round the back: roll ' + (belowSeam === null ? '-' : ((rollOf(belowSeam) * 180) / Math.PI).toFixed(1)) + ' deg below it, ' + (aboveSeam === null ? '-' : ((rollOf(aboveSeam) * 180) / Math.PI).toFixed(1)) + ' deg above');
+  await glide(page, info.canvas.left + 5, info.canvas.top + info.canvas.height - 5, 2);
+  await shot(page, 'page-seam-middle');
+
+  console.log('35. roll the rocket by dragging the strip: the 3D view turns with it');
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  info = await pageInfo(page);
+  const grab = { x: info.originX + 300 * info.zoom, y: info.originY - 20 * info.zoom };
+  const pull = 40;
+  await dragFrom(page, grab, { x: grab.x, y: grab.y + pull }, 10);
+  const rolled = await page.evaluate(function read() {
+    return window.dc6.viewRoll();
+  });
+  const expectedRoll = pull / info.zoom / body.outerRadius;
+  check(Math.abs(rolled - expectedRoll) < 0.03, 'dragging the strip down ' + String(pull) + ' px rolls the view ' + ((rolled * 180) / Math.PI).toFixed(1) + ' deg (expected ' + ((expectedRoll * 180) / Math.PI).toFixed(1) + ')');
+  await glide(page, info.canvas.left + 5, info.canvas.top + info.canvas.height - 5, 2);
+  await shot(page, 'page-rolled');
+  await clickSelector(page, 'button[data-view="side"]');
+  const back = await page.evaluate(function read() {
+    return window.dc6.viewRoll();
+  });
+  check(back === 0, 'the Side view puts the roll back to 0');
+
+  console.log('36. drop a decal from the bin onto a fin island');
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  info = await pageInfo(page);
+  const island = info.islands[0];
+  const islandMiddle = { x: (island.left + island.right) / 2, y: (island.top + island.bottom) / 2 };
+  let finPoint = await pageWorldAt(page, islandMiddle.x, islandMiddle.y);
+  // The bounding box's middle may be off a swept fin: step towards the root.
+  for (let k = 1; k < 10 && finPoint === null; k++) {
+    islandMiddle.x = islandMiddle.x - 3;
+    finPoint = await pageWorldAt(page, islandMiddle.x, islandMiddle.y);
+  }
+  await clickSelector(page, '.art-item[data-artwork-name="lettering"]');
+  await glide(page, islandMiddle.x, islandMiddle.y, 14);
+  await click(page, islandMiddle.x, islandMiddle.y);
+  doc = await documentOf(page);
+  const onFin = doc.decals[doc.decals.length - 1];
+  check(onFin.anchor.placedId === island.placedId && finPoint !== null && distance(onFin.anchor.position, finPoint) < 0.01, 'the lettering is stuck to ' + island.label + ' where it was clicked');
+  const finCentres = await pageCentres(page, onFin.id);
+  check(finCentres.length === 1 && Math.abs(finCentres[0].x - islandMiddle.x) < 1.5 && Math.abs(finCentres[0].y - islandMiddle.y) < 1.5, 'it is drawn on the island where it was dropped');
+  const finHandles = await page.evaluate(function read() {
+    return window.dc6.pageHandles();
+  });
+  const finRotate = finHandles.filter((h) => h.handle === 'rotate')[0];
+  check(finRotate !== undefined && finCentres.length === 1 && finRotate.y < finCentres[0].y - 10 && Math.abs(finRotate.x - finCentres[0].x) < 2, 'put on from the page it stands upright on the page (its rotate handle straight above it)');
+  await shot(page, 'page-fin-decal');
+
+  console.log('37. a file dropped on the page goes where it is dropped');
+  const svgText = readFileSync(join(artFolder, 'logo.svg'), 'utf8');
+  // Whole pixels: a synthetic drag event's position is.
+  const fileDrop = { x: Math.round(info.originX + 120 * info.zoom), y: Math.round(info.originY + 8 * info.zoom) };
+  const decalCount = doc.decals.length;
+  await page.evaluate(function dropFile(a: { text: string; x: number; y: number }) {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([a.text], 'dropped.svg', { type: 'image/svg+xml' }));
+    const target = document.elementFromPoint(a.x, a.y) as HTMLElement;
+    target.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, clientX: a.x, clientY: a.y, dataTransfer: transfer }));
+    target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, clientX: a.x, clientY: a.y, dataTransfer: transfer }));
+    target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, clientX: a.x, clientY: a.y, dataTransfer: transfer }));
+  }, { text: svgText, x: fileDrop.x, y: fileDrop.y });
+  await page.waitForTimeout(400);
+  doc = await documentOf(page);
+  const fileWorld = await pageWorldAt(page, fileDrop.x, fileDrop.y);
+  const dropped = doc.decals[doc.decals.length - 1];
+  check(doc.decals.length === decalCount + 1 && fileWorld !== null && distance(dropped.anchor.position, fileWorld) < 0.01, '(' + String(doc.decals.length - decalCount) + ' new, ' + JSON.stringify(fileWorld) + ' / ' + JSON.stringify(dropped.anchor.position) + ') the dropped SVG is stuck to the rocket at the drop point (the drop event is synthetic: a file cannot be dragged in with the mouse)');
+
+  console.log('38. undo and redo from the page');
+  await glide(page, info.canvas.left + 5, info.canvas.top + info.canvas.height - 5, 2);
+  await page.keyboard.press('Control+z');
+  await page.keyboard.press('Control+z');
+  await page.waitForTimeout(150);
+  doc = await documentOf(page);
+  check(doc.decals.length === decalCount - 1 && (await pageCentres(page, onFin.id)).length === 0, 'two undos take the dropped file and the fin lettering away, on the page too');
+  await page.keyboard.press('Control+Shift+z');
+  await page.waitForTimeout(150);
+  doc = await documentOf(page);
+  check(doc.decals.length === decalCount && (await pageCentres(page, onFin.id)).length === 1, 'redo puts the fin lettering back on the page');
+
+  console.log('39. the divider: drag, reset, put the page away and back');
+  const divider = await page.locator('.divider').first().boundingBox();
+  if (divider === null) {
+    throw new Error('no divider');
+  }
+  const dividerMiddle = { x: 700, y: divider.y + divider.height / 2 };
+  await dragFrom(page, dividerMiddle, { x: 700, y: dividerMiddle.y - 120 }, 8);
+  let canvasBox = await page.locator('.page-pane canvas').first().boundingBox();
+  check(canvasBox !== null && Math.abs(canvasBox.y - (divider.y - 120 + divider.height)) < 1.5, 'dragging the divider up 120 px gives the page 120 px more');
+  await shot(page, 'divider-up');
+  const moved = await page.locator('.divider').first().boundingBox();
+  if (moved === null) {
+    throw new Error('no divider');
+  }
+  await page.mouse.dblclick(700, moved.y + moved.height / 2);
+  await page.waitForTimeout(150);
+  canvasBox = await page.locator('.page-pane canvas').first().boundingBox();
+  check(canvasBox !== null && Math.abs(canvasBox.y - (divider.y + divider.height)) < 3, 'double-clicking the divider puts it back');
+  await dragFrom(page, dividerMiddle, { x: 700, y: 798 }, 8);
+  check(!(await page.locator('.page-pane').first().isVisible()), 'dragging the divider to the bottom puts the page away');
+  const collapsed = await page.locator('.divider').first().boundingBox();
+  if (collapsed === null) {
+    throw new Error('no divider');
+  }
+  await dragFrom(page, { x: 700, y: collapsed.y + 3 }, { x: 700, y: 400 }, 8);
+  check(await page.locator('.page-pane').first().isVisible(), 'and dragging it up brings the page back');
+
+  console.log('40. the finished page');
+  await page.mouse.dblclick(700, 403);
+  await clickSelector(page, 'button[data-view="side"]');
+  await clickSelector(page, 'button[data-view="fit"]');
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  await page.keyboard.press('Escape');
+  await glide(page, 5, 795, 2);
+  await page.waitForTimeout(300);
+  await shot(page, 'page-final');
+  // Closer: the can (window, holes, joints) with the logos, then the fins.
+  let finalInfo = await pageInfo(page);
+  const canPoint = { x: finalInfo.originX + 150 * finalInfo.zoom, y: finalInfo.originY - 0 * finalInfo.zoom };
+  await glide(page, canPoint.x, canPoint.y, 4);
+  for (let k = 0; k < 6; k++) {
+    await page.mouse.wheel(0, -300);
+    await page.waitForTimeout(60);
+  }
+  await page.waitForTimeout(300);
+  await glide(page, 5, 795, 2);
+  await page.waitForTimeout(200);
+  await shot(page, 'page-zoomed-strip');
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  finalInfo = await pageInfo(page);
+  const finPoint2 = { x: finalInfo.originX + 360 * finalInfo.zoom, y: finalInfo.originY - 200 * finalInfo.zoom };
+  await glide(page, finPoint2.x, finPoint2.y, 4);
+  for (let k = 0; k < 4; k++) {
+    await page.mouse.wheel(0, -300);
+    await page.waitForTimeout(60);
+  }
+  await page.waitForTimeout(300);
+  await glide(page, 5, 795, 2);
+  await page.waitForTimeout(200);
+  await shot(page, 'page-zoomed-fins');
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  finalInfo = await pageInfo(page);
+  const tipPoint = { x: finalInfo.originX + 2, y: finalInfo.originY };
+  await glide(page, tipPoint.x, tipPoint.y, 4);
+  for (let k = 0; k < 8; k++) {
+    await page.mouse.wheel(0, -300);
+    await page.waitForTimeout(60);
+  }
+  await page.waitForTimeout(300);
+  await glide(page, 5, 795, 2);
+  await page.waitForTimeout(200);
+  await shot(page, 'page-zoomed-nose');
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  const drawTimes = await page.evaluate(function read() {
+    return window.dc6.pageDrawTimes();
+  });
+  let total = 0;
+  let worst = 0;
+  for (let i = 0; i < drawTimes.length; i++) {
+    total = total + drawTimes[i];
+    worst = Math.max(worst, drawTimes[i]);
+  }
+  console.log('page draws over the whole run (including re-cutting the strip while rolling and re-drawing dragged decals): mean ' + (total / Math.max(1, drawTimes.length)).toFixed(1) + ' ms, worst ' + worst.toFixed(1) + ' ms over ' + String(drawTimes.length) + ' draws (' + String(doc.decals.length) + ' decals)');
 }
 
 await main();

@@ -49,6 +49,7 @@ import { faceOnFace, faceOnSurface, rootOnFace } from './place-on-face.ts';
 import { PartGizmo } from './gizmo.ts';
 import { DecalTool } from './decal-tool.ts';
 import type { Decal } from '../model/decals.ts';
+import type { SurfacePoint } from '../geometry/geodesic.ts';
 
 export type Tool = 'place' | 'move' | 'rotate' | 'face';
 
@@ -151,6 +152,14 @@ export class Editor {
   private readonly targetMarkers = new Markers(13, false, accent);
   private readonly heldMarkers = new Markers(9, false, 0xffffff);
   private readonly activeMarker = new Markers(17, true, accent);
+  // The point the pointer is over on the flat page, shown in 3D.
+  private readonly linkedMarker = new Markers(9, true, 0xffffff);
+  // The surface point under the pointer in the 3D view, for the page to
+  // show (null when the pointer is elsewhere).
+  hoverPoint: SurfacePoint | null = null;
+  // Where the linked marker is (world), for the test hook.
+  linkedPoint: Vec3 | null = null;
+  private readonly hoverListeners: Array<() => void> = [];
 
   readonly gizmo: PartGizmo;
   readonly decals: DecalTool;
@@ -172,6 +181,7 @@ export class Editor {
     this.view.overlayGroup.add(this.targetMarkers.points);
     this.view.overlayGroup.add(this.heldMarkers.points);
     this.view.overlayGroup.add(this.activeMarker.points);
+    this.view.overlayGroup.add(this.linkedMarker.points);
 
     const self = this;
     this.gizmo = new PartGizmo(this.view, container, {
@@ -227,6 +237,21 @@ export class Editor {
 
   addListener(listener: EditorEvents): void {
     this.listeners.push(listener);
+  }
+
+  onHoverPoint(callback: () => void): void {
+    this.hoverListeners.push(callback);
+  }
+
+  // The page's pointer, shown in 3D as a small dot (null hides it).
+  showLinkedPoint(world: Vec3 | null): void {
+    this.linkedPoint = world;
+    if (world === null) {
+      this.linkedMarker.setPositions([]);
+    } else {
+      this.linkedMarker.setPositions([world[0], world[1], world[2]]);
+    }
+    this.view.requestRender();
   }
 
   notify(): void {
@@ -749,7 +774,7 @@ export class Editor {
     requestAnimationFrame(function update() {
       self.updateQueued = false;
       if (self.decals.isBusy()) {
-        self.decals.pointerMove(self.pointerX, self.pointerY, self.shiftDown);
+        self.decals.pointerMove(self.decals.view3d, self.pointerX, self.pointerY, self.shiftDown);
         self.updateHover();
       } else if (self.held !== null) {
         self.updateHeld();
@@ -966,7 +991,7 @@ export class Editor {
       }
       let decalCursor: string | null = null;
       if (this.tool !== 'face' && !this.gizmo.hovered()) {
-        decalCursor = this.decals.cursorAt(this.pointerX, this.pointerY);
+        decalCursor = this.decals.cursorAt(this.decals.view3d, this.pointerX, this.pointerY);
       }
       if (this.gizmo.hovered()) {
         cursor = this.tool === 'move' ? 'move' : 'grab';
@@ -992,6 +1017,16 @@ export class Editor {
       cursor = 'move';
     }
     this.view.canvas.style.cursor = cursor;
+    let hoverPoint: SurfacePoint | null = null;
+    if (this.pointerInside) {
+      hoverPoint = this.decals.surfaceUnder3d(this.pointerX, this.pointerY);
+    }
+    if (hoverPoint !== null || this.hoverPoint !== null) {
+      this.hoverPoint = hoverPoint;
+      for (let i = 0; i < this.hoverListeners.length; i++) {
+        this.hoverListeners[i]();
+      }
+    }
     const changed = hoverId !== this.hoverId || !sameFace(hoverFace, this.hoverFace);
     this.hoverId = hoverId;
     this.hoverFace = hoverFace;
@@ -1013,7 +1048,7 @@ export class Editor {
     let onPart: string | null = null;
     if (event.button === 0 && this.held === null && this.tool !== 'face' && !this.gizmo.hovered()) {
       // Decals first: they lie on top of the parts.
-      if (this.decals.pointerDown(event.clientX, event.clientY)) {
+      if (this.decals.pointerDown(this.decals.view3d, event.clientX, event.clientY)) {
         this.view.controls.enabled = false;
         this.press = { x: event.clientX, y: event.clientY, button: event.button, onPart: null, moved: false, decal: true };
         this.notify();
@@ -1084,8 +1119,8 @@ export class Editor {
       this.pointerX = event.clientX;
       this.pointerY = event.clientY;
       // Bring a drag up to the release point before letting go.
-      this.decals.pointerMove(event.clientX, event.clientY, event.shiftKey);
-      if (this.decals.pointerUp(event.clientX, event.clientY, overCanvas)) {
+      this.decals.pointerMove(this.decals.view3d, event.clientX, event.clientY, event.shiftKey);
+      if (this.decals.pointerUp(this.decals.view3d, event.clientX, event.clientY, overCanvas)) {
         this.updateHover();
         this.notify();
         return;
@@ -1407,24 +1442,21 @@ export class Editor {
 
   setView(preset: PresetView | 'fit'): void {
     const bounds = this.visibleBounds();
-    let centre: Vec3 = [-150, 0, 0];
-    let size = 700;
+    let min: Vec3 = [-500, -100, -100];
+    let max: Vec3 = [200, 100, 100];
     if (bounds !== null) {
-      centre = scale(add(bounds.min, bounds.max), 0.5);
-      // The box's diagonal: it fits from any direction, not only the side.
-      const extent = sub(bounds.max, bounds.min);
-      size = Math.max(100, Math.hypot(extent[0], extent[1], extent[2]));
-    }
-    // Along the axis the rocket is small; frame its diameter.
-    if ((preset === 'nose' || preset === 'tail') && bounds !== null) {
-      const extent = sub(bounds.max, bounds.min);
-      size = Math.max(60, Math.hypot(extent[1], extent[2]) * 1.3);
+      // At least 100 mm each way, so a single small part is not filled edge to edge.
+      const centre = scale(add(bounds.min, bounds.max), 0.5);
+      const half = scale(sub(bounds.max, bounds.min), 0.5);
+      const reach: Vec3 = [Math.max(50, half[0]), Math.max(50, half[1]), Math.max(50, half[2])];
+      min = sub(centre, reach);
+      max = add(centre, reach);
     }
     if (preset === 'fit') {
-      this.view.fit(centre, size);
+      this.view.fit(min, max);
       return;
     }
-    this.view.setPreset(preset, centre, size);
+    this.view.setPreset(preset, min, max);
   }
 
   private visibleBounds(): { min: Vec3; max: Vec3 } | null {

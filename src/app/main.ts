@@ -10,16 +10,28 @@ import { Editor } from './editor.ts';
 import { Ui } from './ui.ts';
 import { Importer } from './importer.ts';
 import { installTestHook } from './test-hook.ts';
+import { Split } from './split.ts';
+import { PagePane } from './page-pane.ts';
+import type { SurfacePoint } from '../geometry/geodesic.ts';
+import type { Vec3 } from '../geometry/vec3.ts';
 
 const root = document.getElementById('app');
 if (root === null) {
   throw new Error('expected an element with id "app"');
 }
+// The 3D view above, the flat page below (see split.ts).
+const split = new Split(root);
 const viewport = document.createElement('div');
 viewport.className = 'viewport';
-root.appendChild(viewport);
+split.upper.appendChild(viewport);
 
 const editor = new Editor(viewport);
+const pagePane = new PagePane(split.lower, editor);
+editor.addListener({
+  changed: function showPageOnceBuilt() {
+    split.setPageWanted(editor.document.placed.length > 0);
+  },
+});
 const importer = new Importer();
 
 async function openFile(name: string, bytes: ArrayBuffer): Promise<void> {
@@ -40,11 +52,15 @@ async function openFile(name: string, bytes: ArrayBuffer): Promise<void> {
   }
 }
 
-// An SVG file becomes artwork in the decal list.
-function openSvg(name: string, text: string): void {
+// An SVG file becomes artwork in the decal list; dropped on the page, it
+// is also put on the rocket at that point.
+function openSvg(name: string, text: string, at: { at: SurfacePoint; right: Vec3 | null } | null): void {
   try {
     const result = editor.decals.addArtwork(text, name);
     ui.showNotice(result.notices);
+    if (result.artwork !== null && at !== null) {
+      editor.decals.placeArtworkAt(result.artwork.id, at.at, at.right);
+    }
   } catch (error) {
     let message = String(error);
     if (error instanceof Error) {
@@ -56,11 +72,14 @@ function openSvg(name: string, text: string): void {
 }
 
 function openFiles(files: File[]): void {
+  // Where on the rocket the files were dropped, if on the page (read now:
+  // the files are read later).
+  const droppedAt = pagePane.takeDrop();
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     if (/\.svg$/i.test(file.name)) {
       file.text().then(function read(text) {
-        openSvg(file.name, text);
+        openSvg(file.name, text, droppedAt);
       });
       continue;
     }
@@ -74,7 +93,7 @@ function openFiles(files: File[]): void {
   }
 }
 
-const ui = new Ui(root, editor, openFiles);
+const ui = new Ui(split.upper, editor, openFiles);
 
 // ?parts=nose,tube,can loads the bundled test parts, in that order.
 async function loadBundledParts(names: string[]): Promise<void> {
@@ -97,4 +116,4 @@ if (partsParameter !== null && partsParameter !== '') {
   bundledLoading = loadBundledParts(partsParameter.split(','));
 }
 
-installTestHook(editor, importer, bundledLoading);
+installTestHook(editor, importer, bundledLoading, pagePane);

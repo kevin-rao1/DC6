@@ -32,6 +32,8 @@ export const nose = {
 
 export const tube = {
   length: 260,
+  // The revised tube of the "one section 10 mm longer" checks.
+  longerLength: 270,
 };
 
 // Modelled on the team's own "can" section: a short waisted shell with a
@@ -133,6 +135,7 @@ export interface Placement {
 export const placements: Record<string, Placement> = {
   nose: { axis: [0, -1, 0], origin: [40, 250, -12], rollDegrees: 0 },
   tube: { axis: [1, 0, 0], origin: [-130, 0, 0], rollDegrees: 0 },
+  'tube-long': { axis: [1, 0, 0], origin: [-130, 0, 0], rollDegrees: 0 },
   can: { axis: [0.3, 0.2, 1], origin: [15, -8, 3], rollDegrees: 30 },
   boattail: { axis: [0, 0, -1], origin: [0, 0, 70], rollDegrees: 0 },
   fin: { axis: [0, 1, 0], origin: [10, 0, 20], rollDegrees: 90 },
