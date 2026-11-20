@@ -56,6 +56,8 @@ export interface UiActions {
   openFiles(files: File[]): void;
   save(): void;
   newProject(): void;
+  // There is work that is not in a saved project file.
+  unsavedWork(): boolean;
   // Replace the part a placed part is made from by a revised STEP file.
   replacePart(placedId: string, file: File): void;
 }
@@ -84,6 +86,10 @@ export class Ui {
   private readonly toolButtons = new Map<Tool, HTMLButtonElement>();
   private readonly symmetryButton: HTMLButtonElement;
   private readonly decalButtons = new Map<string, HTMLButtonElement>();
+  private readonly countInput: HTMLInputElement;
+  private readonly openButton: HTMLButtonElement;
+  private pendingOpen: (() => void) | null = null;
+  private openArmedTimer = 0;
   private readonly undoButton: HTMLButtonElement;
   private readonly redoButton: HTMLButtonElement;
   // By object, not id: a project opened later may reuse an id.
@@ -191,7 +197,34 @@ export class Ui {
     this.symmetryButton.title = 'Symmetry (X, Shift+X)';
     this.symmetryButton.dataset.control = 'symmetry';
     this.symmetryButton.addEventListener('click', function nextSymmetry(event) {
+      if (editor.decals.selectedSymmetry() !== null) {
+        // A decal: type how many copies (X and Shift+X still step).
+        self.editCount();
+        return;
+      }
       editor.stepSymmetry(event.shiftKey ? -1 : 1);
+    });
+    this.countInput = element('input', 'count-input', options);
+    this.countInput.type = 'text';
+    this.countInput.inputMode = 'numeric';
+    this.countInput.spellcheck = false;
+    this.countInput.dataset.control = 'symmetry-count';
+    this.countInput.title = 'Copies round the rocket, 1 to 12; Enter';
+    this.countInput.style.display = 'none';
+    this.countInput.addEventListener('keydown', function keys(event) {
+      if (event.key === 'Enter') {
+        const count = Number(self.countInput.value.trim());
+        if (Number.isInteger(count) && count >= 1 && count <= 12) {
+          editor.decals.setSymmetryCount(count);
+        }
+        self.closeCount();
+      } else if (event.key === 'Escape') {
+        self.closeCount();
+      }
+      event.stopPropagation();
+    });
+    this.countInput.addEventListener('blur', function done() {
+      self.closeCount();
     });
     this.symmetryButton.addEventListener('contextmenu', function previousSymmetry(event) {
       event.preventDefault();
@@ -261,11 +294,14 @@ export class Ui {
       self.newClicked();
     });
     const openButton = element('button', 'view', files);
+    this.openButton = openButton;
     openButton.textContent = 'Open';
     openButton.title = 'Open a project (Ctrl+O)';
     openButton.dataset.control = 'open';
     openButton.addEventListener('click', function openProject() {
-      self.openInput.click();
+      self.askThenOpen(function pick() {
+        self.openInput.click();
+      });
     });
     const saveButton = element('button', 'view', files);
     saveButton.textContent = 'Save';
@@ -323,10 +359,20 @@ export class Ui {
         self.replaceArtwork(target, files[0]);
       }
     });
-    this.layers = new LayerList(side, editor, this.popover, function chooseReplacement(decalId: string) {
-      self.replaceTarget = decalId;
-      self.replaceInput.click();
-    });
+    this.layers = new LayerList(
+      side,
+      editor,
+      this.popover,
+      function chooseReplacement(decalId: string) {
+        self.replaceTarget = decalId;
+        self.replaceInput.click();
+      },
+      function editCount(decalId: string) {
+        editor.decals.select(decalId);
+        editor.notify();
+        self.editCount();
+      },
+    );
     this.exportDialog = new ExportDialog(root, editor, pagePane);
     exportButton.addEventListener('click', function openExport() {
       self.exportDialog.toggle(exportButton);
@@ -392,7 +438,9 @@ export class Ui {
         actions.save();
       } else if (key === 'o') {
         event.preventDefault();
-        self.openInput.click();
+        self.askThenOpen(function pick() {
+          self.openInput.click();
+        });
       }
     });
     this.refresh();
@@ -609,6 +657,54 @@ export class Ui {
     const name = element('span', '', heading);
     name.textContent = folded ? text + ' ' + String(count) : text;
     heading.addEventListener('click', toggle);
+  }
+
+  // ×N for the selected decal: a small field in place of the button.
+  editCount(): void {
+    const current = this.editor.decals.selectedSymmetry();
+    if (current === null) {
+      return;
+    }
+    this.symmetryButton.style.display = 'none';
+    this.countInput.style.display = '';
+    this.countInput.value = String(current.count);
+    this.countInput.focus();
+    this.countInput.select();
+  }
+
+  private closeCount(): void {
+    this.countInput.style.display = 'none';
+    this.symmetryButton.style.display = '';
+  }
+
+  // Opening a project replaces what is there: with unsaved work, the Open
+  // button asks first ("Discard all?") and a second click (or Ctrl+O, or
+  // the same file dropped again) goes ahead.
+  askThenOpen(open: () => void): void {
+    const button = this.openButton;
+    if (!this.actions.unsavedWork()) {
+      open();
+      return;
+    }
+    if (button.classList.contains('armed') && this.pendingOpen !== null) {
+      window.clearTimeout(this.openArmedTimer);
+      button.classList.remove('armed');
+      button.textContent = 'Open';
+      this.pendingOpen = null;
+      open();
+      return;
+    }
+    this.pendingOpen = open;
+    button.classList.add('armed');
+    button.textContent = 'Discard all?';
+    // Clicking the armed button runs what was asked for (a dropped file
+    // included), not a fresh file picker.
+    const self = this;
+    this.openArmedTimer = window.setTimeout(function disarm() {
+      button.classList.remove('armed');
+      button.textContent = 'Open';
+      self.pendingOpen = null;
+    }, 4000);
   }
 
   // New: at once when there is nothing to lose; with work, the first

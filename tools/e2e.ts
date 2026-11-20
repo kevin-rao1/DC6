@@ -1710,9 +1710,11 @@ async function laterSteps(page: Page, browser: Browser): Promise<void> {
   await pickArt(page, 'logo', logoSpot);
   doc = await documentOf(page);
   const ringLogo = doc.decals[doc.decals.length - 1];
-  for (let k = 0; k < 3; k++) {
-    await clickSelector(page, 'button[data-control="symmetry"]');
-  }
+  // Click the x1 and type the count.
+  await clickSelector(page, 'button[data-control="symmetry"]');
+  await page.keyboard.type('4', { delay: 20 });
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(200);
   let members = await groupOf(page, ringLogo.id);
   doc = await documentOf(page);
   const ringRolls: number[] = [];
@@ -1727,12 +1729,98 @@ async function laterSteps(page: Page, browser: Browser): Promise<void> {
   for (let i = 1; i < ringRolls.length; i++) {
     even = even && Math.abs(ringRolls[i] - ringRolls[i - 1] - 90) < 0.5;
   }
-  check(even, 'three clicks on x1 make x4: four linked copies 90 degrees apart (' + ringRolls.map((r) => r.toFixed(1)).join(', ') + ')');
+  check(even, 'clicking x1 and typing 4 makes four linked copies 90 degrees apart (' + ringRolls.map((r) => r.toFixed(1)).join(', ') + ')');
   check((await page.locator('button[data-control="symmetry"]').first().textContent()) === '×4', 'the toolbar shows x4 for the selected decal');
   const ringRow = page.locator('.layer-row[data-count="4"]');
   check((await ringRow.count()) === 1 && /×4/.test((await ringRow.first().textContent()) ?? ''), 'the layer list shows the set as one row with a x4 badge');
   await glide(page, away.x, away.y, 2);
   await shot(page, 'decal-x4-3d-side');
+  // On the page: each copy drawn in its own place at its own size.
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  await settle(page);
+  await glide(page, away.x, away.y, 2);
+  let copiesOk = true;
+  let copyReport = '';
+  for (let i = 0; i < members.length; i++) {
+    const shapes = await page.evaluate(function read(id: string) {
+      return window.dc6.pageDecalShape(id);
+    }, members[i]);
+    const main = shapes.filter((c) => c.copy === 0)[0];
+    let longestEdge = 0;
+    for (let k = 0; k < shapes.length; k++) {
+      longestEdge = Math.max(longestEdge, shapes[k].longestEdge);
+    }
+    copiesOk = copiesOk && main !== undefined && Math.abs(main.area - 1600) < 30 && longestEdge < 3;
+    copyReport = copyReport + (main === undefined ? ' none' : ' ' + main.area.toFixed(0) + ' mm² / ' + longestEdge.toFixed(2) + ' mm');
+  }
+  check(copiesOk, 'on the page each copy covers its own 40 x 40 mm and no triangle of it is longer than a grid cell or two (' + copyReport.trim() + ')');
+  // Pixels: between the copy facing the viewer (roll 0) and the one on top
+  // (roll 90) the page shows the white tube, not cerise.
+  const ringDoc = await documentOf(page);
+  let low: { x: number; y: number } | null = null;
+  let high: { x: number; y: number } | null = null;
+  for (let i = 0; i < members.length; i++) {
+    const roll = (rollOf(decalById(ringDoc, members[i]).anchor.position) * 180) / Math.PI;
+    const centres = await pageCentres(page, members[i]);
+    if (Math.abs(roll) < 5 && centres.length > 0) {
+      low = centres[0];
+    }
+    if (Math.abs(roll - 90) < 5 && centres.length > 0) {
+      high = centres[0];
+    }
+  }
+  if (low === null || high === null) {
+    throw new Error('copies at roll 0 and 90 not found on the page');
+  }
+  // (No selection: its handles would sit in that gap.)
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+  const samples = await page.evaluate(function pixels(a: { low: { x: number; y: number }; high: { x: number; y: number } }) {
+    const canvas = document.querySelector('.page-pane canvas') as HTMLCanvasElement;
+    const rect = canvas.getBoundingClientRect();
+    const context = canvas.getContext('2d') as CanvasRenderingContext2D;
+    const ratio = canvas.width / rect.width;
+    function at(x: number, y: number): number[] {
+      const data = context.getImageData(Math.round((x - rect.left) * ratio), Math.round((y - rect.top) * ratio), 1, 1).data;
+      return [data[0], data[1], data[2]];
+    }
+    const row: number[][] = [];
+    const y = (a.low.y + a.high.y) / 2;
+    for (let dx = -12; dx <= 12; dx = dx + 3) {
+      row.push(at(a.low.x + dx, y));
+    }
+    return { gap: row, centre: at(a.low.x - 6, a.low.y + 3) };
+  }, { low: low, high: high });
+  let tubeColoured = true;
+  for (let i = 0; i < samples.gap.length; i++) {
+    const p = samples.gap[i];
+    tubeColoured = tubeColoured && p[0] > 200 && p[1] > 200 && p[2] > 200;
+  }
+  const centreIsCerise = samples.centre[0] > 180 && samples.centre[1] < 120;
+  check(tubeColoured && centreIsCerise, 'a row of page pixels between two copies is the white tube, and the copy itself is cerise (gap ' + JSON.stringify(samples.gap[4]) + ', copy ' + JSON.stringify(samples.centre) + ')');
+  await shot(page, 'decal-x4-page-fit');
+  await clickSelector(page, '.layer-row[data-count="4"] .tree-name');
+  await glide(page, low.x, (low.y + high.y) / 2, 4);
+  for (let k = 0; k < 5; k++) {
+    await page.mouse.wheel(0, -300);
+    await page.waitForTimeout(60);
+  }
+  await page.waitForTimeout(300);
+  await glide(page, away.x, away.y, 2);
+  await page.waitForTimeout(200);
+  await shot(page, 'decal-x4-page-zoomed');
+  await clickSelector(page, 'button[data-control="page-fit"]');
+  // Any count up to 12 can be typed: on the layer row's badge too.
+  await clickSelector(page, '.layer-row[data-count="4"] .badge');
+  await page.keyboard.press('Control+a');
+  await page.keyboard.type('12', { delay: 20 });
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(200);
+  check((await groupOf(page, ringLogo.id)).length === 12, 'typing 12 on the x4 badge makes twelve copies');
+  await glide(page, away.x, away.y, 2);
+  await page.keyboard.press('Control+z');
+  members = await groupOf(page, ringLogo.id);
+  check(members.length === 4, 'undo: four again');
   // A three-quarter view, to see the copies round the back.
   const orbitFrom = { x: canvas.x + canvas.width * 0.3, y: canvas.y + canvas.height * 0.85 };
   await glide(page, orbitFrom.x, orbitFrom.y, 2);
@@ -2047,10 +2135,16 @@ async function laterSteps(page: Page, browser: Browser): Promise<void> {
   await page.waitForTimeout(300);
   await glide(page, away.x, away.y, 2);
   await shot(page, 'autosave-restored');
+  // Restored work is not in a saved file: Open asks before it replaces it.
+  await clickSelector(page, 'button[data-control="open"]');
+  check((await page.locator('button[data-control="open"]').first().textContent()) === 'Discard all?', 'with unsaved work, Open asks first ("Discard all?")');
+  await page.waitForTimeout(4300);
+  check((await page.locator('button[data-control="open"]').first().textContent()) === 'Open', 'and lets it go after a few seconds');
 
   console.log('55. replace the tube with a revised file 10 mm longer');
   const tubeDecals = doc.decals.filter((d) => d.anchor.placedId === tube.id);
   const stripBefore = (await pageInfo(page)).stripLength;
+  const beforeReplace = await documentOf(page);
   await clearLongTasks(page);
   await chooseFile(page, '.tree-row[data-placed-id="' + tube.id + '"] [data-action="replace-part"]', join(process.cwd(), 'test-models', 'tube-long.step'));
   await page.waitForTimeout(300);
@@ -2069,9 +2163,16 @@ async function laterSteps(page: Page, browser: Browser): Promise<void> {
   }
   check(kept && worstMove < 2 && /stayed in place/.test(toast), 'its ' + String(tubeDecals.length) + ' decals stay on it (moved at most ' + worstMove.toFixed(3) + ' mm), and it says so: "' + toast + '"');
   const stripAfter = (await pageInfo(page)).stripLength;
-  // The tube was turned end for end in step 3, so the extra 10 mm is at
-  // its aft end, mostly inside the boattail: only what shows is added.
-  check(stripAfter > stripBefore + 0.1 && stripAfter <= stripBefore + 10.01, 'the page is built again with the new tube (strip ' + stripBefore.toFixed(1) + ' -> ' + stripAfter.toFixed(1) + ' mm; the extra 10 mm is mostly inside the boattail)');
+  // The tube was turned end for end in step 3, so the 10 mm are added at
+  // its aft end: the boattail on that end moves 10 mm aft with it; the can
+  // and nose on the other end stay put.
+  const shiftOf = function shiftOf(name: string): number {
+    const a = one(beforeReplace, names, name).transform.position;
+    const b = one(doc, names, name).transform.position;
+    return Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) * Math.sign(b[0] - a[0] + 1e-12);
+  };
+  check(Math.abs(shiftOf('boattail') - 10) < 0.01 && Math.abs(shiftOf('can')) < 1e-6 && Math.abs(shiftOf('nose')) < 1e-6, 'what hangs on the tube stays attached: the boattail moves out 10 mm (' + shiftOf('boattail').toFixed(3) + ' mm), can and nose stay (' + shiftOf('can').toFixed(3) + ', ' + shiftOf('nose').toFixed(3) + ' mm)');
+  check(Math.abs(stripAfter - stripBefore - 10) < 0.5, 'the page strip is 10 mm longer (' + stripBefore.toFixed(1) + ' -> ' + stripAfter.toFixed(1) + ' mm)');
   let longest = 0;
   for (let i = 0; i < tasks.length; i++) {
     longest = Math.max(longest, tasks[i]);

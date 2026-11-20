@@ -57,6 +57,9 @@ export interface TestHook {
   // The world point under a client position on the page.
   pageWorldAt(x: number, y: number): Vec3 | null;
   pageDecalCentres(id: string): Array<{ x: number; y: number }>;
+  // A decal's drawing on the page: how many triangles, the longest
+  // triangle edge (mm) and the area they cover (mm²), per drawing (copy).
+  pageDecalShape(id: string): Array<{ copy: number; triangles: number; longestEdge: number; area: number }>;
   pageHandles(): Array<{ handle: string; x: number; y: number }>;
   // Client y of the strip's top and bottom (seam) edges at page x.
   pageStripEdges(x: number): { top: number; bottom: number } | null;
@@ -256,6 +259,25 @@ export function installTestHook(editor: Editor, importer: Importer, bundled: Pro
     },
     pageDecalCentres: function pageDecalCentres(id: string) {
       return pagePane.decalCentres(id);
+    },
+    pageDecalShape: function pageDecalShape(id: string) {
+      const triangles = pagePane.decalTriangles(id);
+      const byCopy = new Map<number, { copy: number; triangles: number; longestEdge: number; area: number }>();
+      for (let t = 0; t < triangles.length; t++) {
+        const p = triangles[t].page;
+        let entry = byCopy.get(triangles[t].copy);
+        if (entry === undefined) {
+          entry = { copy: triangles[t].copy, triangles: 0, longestEdge: 0, area: 0 };
+          byCopy.set(triangles[t].copy, entry);
+        }
+        entry.triangles = entry.triangles + 1;
+        for (let k = 0; k < 3; k++) {
+          const kk = (k + 1) % 3;
+          entry.longestEdge = Math.max(entry.longestEdge, Math.hypot(p[2 * k] - p[2 * kk], p[2 * k + 1] - p[2 * kk + 1]));
+        }
+        entry.area = entry.area + Math.abs((p[2] - p[0]) * (p[5] - p[1]) - (p[4] - p[0]) * (p[3] - p[1])) / 2;
+      }
+      return Array.from(byCopy.values());
     },
     pageHandles: function pageHandles() {
       return pagePane.handleScreenPoints();

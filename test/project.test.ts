@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Vec3 } from '../src/geometry/vec3.ts';
-import { applyToPoint } from '../src/geometry/transform.ts';
+import { applyToDirection, applyToPoint } from '../src/geometry/transform.ts';
 import type { Surface } from '../src/geometry/geodesic.ts';
 import { nearestOnSurface, pieceIndex, worldNormal } from '../src/geometry/geodesic.ts';
 import { anchorOf, defaultRight, frameAt, frameOf } from '../src/geometry/decal-map.ts';
@@ -20,7 +20,8 @@ import { setDecalSymmetry } from '../src/model/decal-symmetry.ts';
 import { cutPiecesOf } from '../src/model/cut-pieces.ts';
 import type { ProjectContent } from '../src/model/project.ts';
 import { fromBase64, hashBytes, readProject, toBase64, writeProject } from '../src/model/project.ts';
-import { checkDistance, reattachDecals, swapPart } from '../src/model/replace-part.ts';
+import { checkDistance, reattachDecals, reseatChildren, swapPart } from '../src/model/replace-part.ts';
+import type { Part } from '../src/geometry/part.ts';
 import { assembledRocket } from './rocket.ts';
 import type { AssembledRocket } from './rocket.ts';
 import { surfaceOf } from './surfaces.ts';
@@ -207,6 +208,74 @@ describe('replacing a part with a revised file', () => {
         throw new Error('no frame');
       }
       expect(frame.right[0] * oldFrame.right[0] + frame.right[1] * oldFrame.right[1] + frame.right[2] * oldFrame.right[2]).toBeGreaterThan(0.999);
+    }
+  });
+
+  it('the tube 10 mm longer: what is stacked on its grown end moves out 10 mm, keeping any offset; the rest stays', async () => {
+    const rocket = await assembledRocket('tube');
+    const tube = rocket.placed.filter((p) => p.id === 'tube')[0];
+    // The tube's two end faces, by which way they face.
+    let fore = -1;
+    let aft = -1;
+    for (let f = 0; f < tube.part.attachFaces.length; f++) {
+      const n = applyToDirection(tube.transform, tube.part.attachFaces[f].normal);
+      if (n[0] < -0.99) {
+        fore = f;
+      }
+      if (n[0] > 0.99) {
+        aft = f;
+      }
+    }
+    const doc = documentOf(rocket);
+    for (let i = 0; i < doc.placed.length; i++) {
+      const placed = doc.placed[i];
+      if (placed.id === 'can') {
+        // Snapped by its internals on the fore end, then pushed in: the joint says which faces.
+        placed.joint = { ownFace: 0, parentFace: fore };
+      } else if (placed.id === 'boattail') {
+        placed.joint = { ownFace: 0, parentFace: aft };
+      } else if (placed.id.startsWith('fin')) {
+        const part = rocket.placed[i].part;
+        placed.joint = { ownFace: part.guessedAttachFace, parentFace: null };
+      } else if (placed.id === 'nose') {
+        placed.parentId = 'can';
+        placed.joint = { ownFace: 0, parentFace: 0 };
+      }
+    }
+    const longTube = await loadPart('tube-long');
+    longTube.id = 'tube-long.step#0';
+    const parts = new Map<string, Part>();
+    for (let i = 0; i < rocket.placed.length; i++) {
+      parts.set(rocket.placed[i].part.id, rocket.placed[i].part);
+    }
+    parts.set(longTube.id, longTube);
+    const swapped = swapPart(doc, tube.part.id, longTube.id, tube.part, longTube);
+    const list: Placed[] = rocket.placed.map((p) => (p.id === 'tube' ? { id: 'tube', part: longTube, transform: p.transform } : p));
+    const result = reseatChildren(doc, swapped, tube.part.id, tube.part, longTube, parts, rocket.surface, surfaceOf(list));
+    function shift(id: string): Vec3 {
+      const a = doc.placed.filter((p) => p.id === id)[0].transform.position;
+      const b = result.doc.placed.filter((p) => p.id === id)[0].transform.position;
+      return [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    }
+    const canShift = shift('can');
+    const tailShift = shift('boattail');
+    console.log('tube 10 mm longer: can moved ' + canShift.map((v) => v.toFixed(3)).join(', ') + ' mm, boattail ' + tailShift.map((v) => v.toFixed(3)).join(', ') + ' mm');
+    // One end grew by 10 mm: the part on it moves 10 mm along the axis, outwards; the other stays.
+    const moves = [Math.hypot(canShift[0], canShift[1], canShift[2]), Math.hypot(tailShift[0], tailShift[1], tailShift[2])].sort((a, b) => a - b);
+    expect(moves[0]).toBeLessThan(1e-6);
+    expect(Math.abs(moves[1] - 10)).toBeLessThan(1e-3);
+    expect(Math.abs(Math.abs(canShift[0] + tailShift[0]) - 10)).toBeLessThan(1e-3);
+    if (Math.abs(canShift[0]) > 1) {
+      expect(canShift[0]).toBeLessThan(0); // out towards the nose
+      // The nose on the can comes with it.
+      expect(Math.abs(shift('nose')[0] - canShift[0])).toBeLessThan(1e-9);
+    } else {
+      expect(tailShift[0]).toBeGreaterThan(0); // out towards the tail
+    }
+    // The fins stand on the same radius: they stay (within the tessellation).
+    for (let k = 1; k <= 4; k++) {
+      const finShift = shift('fin' + String(k));
+      expect(Math.hypot(finShift[0], finShift[1], finShift[2])).toBeLessThan(0.1);
     }
   });
 

@@ -50,7 +50,7 @@ import { faceOnFace, faceOnSurface, rootOnFace } from './place-on-face.ts';
 import { PartGizmo } from './gizmo.ts';
 import { DecalTool } from './decal-tool.ts';
 import type { ReattachReport } from '../model/replace-part.ts';
-import { reattachDecals, swapPart } from '../model/replace-part.ts';
+import { reattachDecals, reseatChildren, swapPart } from '../model/replace-part.ts';
 import type { Decal } from '../model/decals.ts';
 import type { SurfacePoint } from '../geometry/geodesic.ts';
 
@@ -359,7 +359,10 @@ export class Editor {
       }
     }
     const newSurface = this.decals.surfaceFor(swapped);
-    const result = reattachDecals(swapped, oldSurface, newSurface, moved);
+    // What hangs on it stays attached where it was on it (a longer tube
+    // pushes the part on its far end out).
+    const reseated = reseatChildren(before, swapped, oldPartId, oldPart, newPart, this.parts, oldSurface, newSurface);
+    const result = reattachDecals(reseated.doc, oldSurface, newSurface, moved);
     this.commit(result.doc);
     return result.report;
   }

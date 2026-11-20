@@ -200,6 +200,23 @@ button {
   font-size: 11px;
 }
 
+.count-input {
+  width: 40px;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: #0a0a0c;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  outline: none;
+}
+
+.badge[data-action='count'] {
+  cursor: text;
+}
+
 .tool.words {
   font-family: var(--sans);
   font-size: 11.5px;

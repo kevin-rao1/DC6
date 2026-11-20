@@ -1198,7 +1198,7 @@ export class DecalTool {
 
   setSymmetryCount(count: number): void {
     const current = this.selectedSymmetry();
-    if (current === null || count < 1) {
+    if (current === null || count < 1 || count > 12 || Math.floor(count) !== count) {
       return;
     }
     this.resymmetrise(count, current.mirror, current.flipMirror);

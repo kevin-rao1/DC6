@@ -144,15 +144,17 @@ export class LayerList {
   private readonly editor: Editor;
   private readonly popover: ColourPopover;
   private readonly replaceFile: (decalId: string) => void;
+  private readonly editCount: (decalId: string) => void;
   private renaming: string | null = null;
   // Reordering by dragging a row.
   private dragging: { id: string; startY: number; moved: boolean; target: number } | null = null;
   private readonly marker: HTMLDivElement;
 
-  constructor(parent: HTMLElement, editor: Editor, popover: ColourPopover, replaceFile: (decalId: string) => void) {
+  constructor(parent: HTMLElement, editor: Editor, popover: ColourPopover, replaceFile: (decalId: string) => void, editCount: (decalId: string) => void) {
     this.editor = editor;
     this.popover = popover;
     this.replaceFile = replaceFile;
+    this.editCount = editCount;
     this.panel = element('div', 'tree layers', parent);
     this.marker = element('div', 'drop-marker', null);
     const self = this;
@@ -246,7 +248,12 @@ export class LayerList {
       if (entry.ids.length > 1) {
         const badge = element('span', 'badge', name);
         badge.textContent = '×' + String(entry.ids.length);
-        badge.title = String(entry.ids.length) + ' linked copies';
+        badge.title = String(entry.ids.length) + ' linked copies; click to change how many';
+        badge.dataset.action = 'count';
+        badge.addEventListener('click', function count(event) {
+          event.stopPropagation();
+          self.editCount(decal.id);
+        });
       }
       name.addEventListener('dblclick', function rename(event) {
         event.stopPropagation();

@@ -173,19 +173,34 @@ export function decalOutlines(
         const runs: number[][] = [];
         let run: number[] = [];
         let first = -1;
+        let whole = true;
+        let lastCarried = -1;
         for (let q = 0; q < frame.length; q++) {
           const p = carry(index, copy, frame[q][0], frame[q][1]);
           if (p === null) {
+            whole = false;
             if (run.length > 0) {
               runs.push(run);
               run = [];
             }
             continue;
           }
+          // A step that jumps on the page crosses a seam inside one drawing
+          // (both sides of it are in one drawing): the outline breaks there.
+          if (run.length > 0 && q > 0) {
+            const stepLength = Math.hypot(frame[q][0] - frame[q - 1][0], frame[q][1] - frame[q - 1][1]);
+            const jump = Math.hypot(p[0] - run[run.length - 2], p[1] - run[run.length - 1]);
+            if (jump > 4 * stepLength + 0.5) {
+              whole = false;
+              runs.push(run);
+              run = [];
+            }
+          }
           if (first < 0) {
             first = q;
           }
           run.push(p[0], p[1]);
+          lastCarried = q;
         }
         if (run.length > 0) {
           runs.push(run);
@@ -193,15 +208,19 @@ export function decalOutlines(
         if (runs.length === 0) {
           continue;
         }
-        if (runs.length === 1 && first === 0 && runs[0].length === frame.length * 2) {
+        if (runs.length === 1 && whole && first === 0 && runs[0].length === frame.length * 2) {
           outlines.push({ points: runs[0], closed: true });
           continue;
         }
         // Broken: the last run carries on into the first if the outline
         // was whole across its start.
-        if (runs.length > 1 && first === 0 && carry(index, copy, frame[frame.length - 1][0], frame[frame.length - 1][1]) !== null) {
-          const last = runs.pop() as number[];
-          runs[0] = last.concat(runs[0]);
+        if (runs.length > 1 && first === 0 && lastCarried === frame.length - 1) {
+          const last = runs[runs.length - 1];
+          const jump = Math.hypot(runs[0][0] - last[last.length - 2], runs[0][1] - last[last.length - 1]);
+          if (jump <= 4 * step + 0.5) {
+            runs.pop();
+            runs[0] = last.concat(runs[0]);
+          }
         }
         for (let r = 0; r < runs.length; r++) {
           if (runs[r].length >= 4) {

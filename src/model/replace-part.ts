@@ -13,12 +13,14 @@
 
 import type { Part } from '../geometry/part.ts';
 import type { Vec3 } from '../geometry/vec3.ts';
-import { dot, length, sub } from '../geometry/vec3.ts';
+import { dot, length, scale, sub } from '../geometry/vec3.ts';
+import type { Quat, RigidTransform } from '../geometry/transform.ts';
+import { applyToDirection, applyToPoint, compose, quatFromUnitVectors, rotateVector } from '../geometry/transform.ts';
 import type { Surface } from '../geometry/geodesic.ts';
 import { nearestOnSurface, pieceIndex } from '../geometry/geodesic.ts';
 import { anchorOf, defaultRight, frameAt, frameOf, rotateInPlane } from '../geometry/decal-map.ts';
 import type { AssemblyDocument } from './document.ts';
-import { cloneDocument } from './document.ts';
+import { childrenOf, cloneDocument, moveSubtreeBy } from './document.ts';
 
 export const checkDistance = 2;
 export const searchDistance = 10;
@@ -97,6 +99,97 @@ export function swapPart(doc: AssemblyDocument, oldPartId: string, newPartId: st
     next.attachFaceByPart[newPartId] = matchingFace(oldPart, newPart, chosen);
   }
   return next;
+}
+
+// The parts hung on a replaced part stay attached where they were on it:
+// each moves (with what hangs on it) as the place it was attached at moved.
+// A part joined face to face (stacked on an end) moves as the replaced
+// part's face moved, from the old face to the matching face of the new
+// part: a tube 10 mm longer pushes what is on its far end out by 10 mm,
+// and a part that was slid along after it snapped keeps its offset. A part
+// standing on the surface (a fin) moves as the nearest surface point to
+// its attach face moved, from the old surface to the new. Joints say which
+// faces were joined, so stacked parts need no search.
+//   `before`: the document before the swap (its joints name old faces);
+//   `swapped`: after swapPart; `parts`: every loaded part by id.
+export function reseatChildren(
+  before: AssemblyDocument,
+  swapped: AssemblyDocument,
+  oldPartId: string,
+  oldPart: Part,
+  newPart: Part,
+  parts: Map<string, Part>,
+  oldSurface: Surface,
+  newSurface: Surface,
+): { doc: AssemblyDocument; moved: Array<{ placedId: string; distance: number }> } {
+  let next = cloneDocument(swapped);
+  const moved: Array<{ placedId: string; distance: number }> = [];
+  for (let p = 0; p < before.placed.length; p++) {
+    const parent = before.placed[p];
+    if (parent.partId !== oldPartId) {
+      continue;
+    }
+    const children = childrenOf(before, parent.id);
+    for (let c = 0; c < children.length; c++) {
+      const child = children[c];
+      const joint = child.joint;
+      if (joint === null) {
+        continue;
+      }
+      let motion: RigidTransform | null = null;
+      if (joint.parentFace !== null) {
+        if (joint.parentFace < 0 || joint.parentFace >= oldPart.attachFaces.length) {
+          continue;
+        }
+        const newIndex = matchingFace(oldPart, newPart, joint.parentFace);
+        if (newIndex < 0) {
+          continue;
+        }
+        const oldFace = oldPart.attachFaces[joint.parentFace];
+        const newFace = newPart.attachFaces[newIndex];
+        const oldCentre = applyToPoint(parent.transform, oldFace.centre);
+        const newCentre = applyToPoint(parent.transform, newFace.centre);
+        const oldNormal = applyToDirection(parent.transform, oldFace.normal);
+        const newNormal = applyToDirection(parent.transform, newFace.normal);
+        // Turn about the old face centre as the face turned, then slide.
+        const turn = rotationAbout(oldCentre, quatFromUnitVectors(oldNormal, newNormal));
+        motion = compose({ position: sub(newCentre, oldCentre), rotation: [0, 0, 0, 1] }, turn);
+      } else {
+        const childPart = parts.get(child.partId);
+        if (childPart === undefined || joint.ownFace < 0 || joint.ownFace >= childPart.attachFaces.length) {
+          continue;
+        }
+        const oldPiece = pieceIndex(oldSurface, parent.id);
+        const newPiece = pieceIndex(newSurface, parent.id);
+        if (oldPiece < 0 || newPiece < 0) {
+          continue;
+        }
+        const ownCentre = applyToPoint(child.transform, childPart.attachFaces[joint.ownFace].centre);
+        const inward = scale(applyToDirection(child.transform, childPart.attachFaces[joint.ownFace].normal), -1);
+        const was = nearestOnSurface(oldSurface, ownCentre, inward, searchDistance, [oldPiece]);
+        const now = nearestOnSurface(newSurface, ownCentre, inward, searchDistance, [newPiece]);
+        if (was === null || now === null) {
+          continue;
+        }
+        const wasPoint = applyToPoint(oldSurface.pieces[oldPiece].transform, was.at.point);
+        const nowPoint = applyToPoint(newSurface.pieces[newPiece].transform, now.at.point);
+        motion = { position: sub(nowPoint, wasPoint), rotation: [0, 0, 0, 1] };
+      }
+      const distance = length(motion.position);
+      if (distance < 1e-9 && Math.abs(motion.rotation[3]) > 1 - 1e-12) {
+        continue;
+      }
+      next = moveSubtreeBy(next, child.id, motion);
+      moved.push({ placedId: child.id, distance: distance });
+    }
+  }
+  return { doc: next, moved: moved };
+}
+
+// A rotation about a point, as a rigid transform.
+function rotationAbout(point: Vec3, rotation: Quat): RigidTransform {
+  const turned = rotateVector(rotation, point);
+  return { position: sub(point, turned), rotation: rotation };
 }
 
 // Put each decal stuck on one of `placedIds` onto the new surface (see

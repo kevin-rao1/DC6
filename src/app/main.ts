@@ -81,6 +81,13 @@ function openSvg(name: string, text: string, at: { at: SurfacePoint; right: Vec3
 // ---------------------------------------------------------------------------
 // The project file.
 
+// What the work is, to tell whether it has changed since it was saved or
+// opened.
+let savedFingerprint = '';
+function workFingerprint(): string {
+  return JSON.stringify([editor.document, editor.partOrder, editor.decals.artworkOrder]);
+}
+
 let opening: Promise<void> = Promise.resolve();
 
 async function openContent(content: ProjectContent): Promise<void> {
@@ -105,6 +112,7 @@ function openProjectText(name: string, text: string): void {
     try {
       const content = await readProject(text);
       await openContent(content);
+      savedFingerprint = workFingerprint();
       lastSaved = '';
       scheduleAutosave();
     } catch (error) {
@@ -126,6 +134,7 @@ async function saveProject(): Promise<void> {
       }
     }
     downloadBlob(name + '.dc6', new Blob([text], { type: 'application/json' }));
+    savedFingerprint = workFingerprint();
   } catch (error) {
     ui.showError('Save: ' + messageOf(error));
   }
@@ -149,7 +158,9 @@ function openFiles(files: File[]): void {
     const file = files[i];
     if (/\.dc6$/i.test(file.name)) {
       file.text().then(function read(text) {
-        openProjectText(file.name, text);
+        ui.askThenOpen(function open() {
+          openProjectText(file.name, text);
+        });
       });
       continue;
     }
@@ -215,6 +226,11 @@ const ui = new Ui(split.upper, editor, pagePane, {
     void saveProject();
   },
   newProject: newProject,
+  unsavedWork: function unsavedWork(): boolean {
+    const doc = editor.document;
+    const work = editor.partOrder.length > 0 || editor.decals.artworkOrder.length > 0 || doc.placed.length > 0;
+    return work && workFingerprint() !== savedFingerprint;
+  },
   replacePart: function replace(placedId: string, file: File) {
     void replacePart(placedId, file);
   },

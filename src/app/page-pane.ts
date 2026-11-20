@@ -21,7 +21,7 @@ import { applyToPoint } from '../geometry/transform.ts';
 import { barycentricOf, pointFromBarycentric } from '../geometry/surface-mesh.ts';
 import type { DecalFrame, DecalGrid } from '../geometry/decal-map.ts';
 import type { DecalPageTriangle, Page, PageView } from '../geometry/page.ts';
-import { decalPageTriangles, islandGap, decalPointAt, decalToPage, pageToSurface, surfaceToPage, viewPage } from '../geometry/page.ts';
+import { decalPageTriangles, islandGap, rasterTriangles, decalPointAt, decalToPage, pageToSurface, surfaceToPage, viewPage } from '../geometry/page.ts';
 import { radiusOf } from '../geometry/page-strip.ts';
 import type { Artwork } from '../geometry/artwork.ts';
 import type { AssemblyDocument } from '../model/document.ts';
@@ -1019,7 +1019,7 @@ export class PagePane {
       return;
     }
     const texture = this.texture(artwork, decal.colourMap, Math.max(decal.width, decal.height));
-    const triangles = rasterTriangles(drawing, scale);
+    const triangles = rasterTriangles(drawing.grid, drawing.triangles, scale);
     for (let t = 0; t < triangles.length; t++) {
       const triangle = triangles[t];
       const destination: number[] = [];
@@ -1354,6 +1354,12 @@ export class PagePane {
     return result;
   }
 
+  // A decal's triangles on the page (page mm), for the test hook.
+  decalTriangles(id: string): DecalPageTriangle[] {
+    const drawing = this.drawings.get(id);
+    return drawing === undefined ? [] : drawing.triangles;
+  }
+
   // Client positions of a decal's centre, one per drawing of it.
   decalCentres(id: string): Array<{ x: number; y: number }> {
     const drawing = this.drawings.get(id);
@@ -1418,117 +1424,6 @@ function fitLabel(context: CanvasRenderingContext2D, text: string, room: number)
     }
   }
   return null;
-}
-
-// The triangles a decal's bitmap is drawn from. Each grid triangle costs a
-// clip and a draw, which is most of a second for a few big decals; where
-// the bitmap is coarse, blocks of whole grid cells are drawn as two
-// triangles instead, so a block is about 6 bitmap pixels across. Inside a
-// block the page map is not quite affine (it bends at the mesh's facet
-// lines), but by well under a pixel at that resolution. A block with a
-// missing cell (a hole, an edge, the seam) is drawn cell by cell.
-function rasterTriangles(drawing: DecalDrawing, pixelsPerMillimetre: number): DecalPageTriangle[] {
-  const grid = drawing.grid;
-  let cell = Infinity;
-  for (let i = 0; i + 1 < grid.xs.length; i++) {
-    cell = Math.min(cell, grid.xs[i + 1] - grid.xs[i]);
-  }
-  for (let j = 0; j + 1 < grid.ys.length; j++) {
-    cell = Math.min(cell, grid.ys[j + 1] - grid.ys[j]);
-  }
-  const step = Math.min(8, Math.floor(6 / Math.max(1e-9, cell * pixelsPerMillimetre)));
-  if (!Number.isFinite(cell) || step <= 1) {
-    return drawing.triangles;
-  }
-  const columnOf = new Map<number, number>();
-  for (let i = 0; i < grid.xs.length; i++) {
-    columnOf.set(grid.xs[i], i);
-  }
-  const rowOf = new Map<number, number>();
-  for (let j = 0; j < grid.ys.length; j++) {
-    rowOf.set(grid.ys[j], j);
-  }
-  // Per drawing (copy): the page point of each grid point, and the
-  // triangles of each cell.
-  const corners = new Map<string, [number, number]>();
-  const cells = new Map<string, DecalPageTriangle[]>();
-  const copies: number[] = [];
-  for (let t = 0; t < drawing.triangles.length; t++) {
-    const triangle = drawing.triangles[t];
-    let lowI = Infinity;
-    let lowJ = Infinity;
-    for (let q = 0; q < 3; q++) {
-      const i = columnOf.get(triangle.decal[2 * q]);
-      const j = rowOf.get(triangle.decal[2 * q + 1]);
-      if (i === undefined || j === undefined) {
-        return drawing.triangles; // not on the grid lines: draw as it is
-      }
-      corners.set(String(triangle.copy) + ':' + String(i) + ':' + String(j), [triangle.page[2 * q], triangle.page[2 * q + 1]]);
-      lowI = Math.min(lowI, i);
-      lowJ = Math.min(lowJ, j);
-    }
-    const key = String(triangle.copy) + ':' + String(lowI) + ':' + String(lowJ);
-    let list = cells.get(key);
-    if (list === undefined) {
-      list = [];
-      cells.set(key, list);
-    }
-    list.push(triangle);
-    if (copies.indexOf(triangle.copy) < 0) {
-      copies.push(triangle.copy);
-    }
-  }
-  const result: DecalPageTriangle[] = [];
-  for (let c = 0; c < copies.length; c++) {
-    const copy = String(copies[c]);
-    for (let bj = 0; bj + 1 < grid.rows; bj = bj + step) {
-      const tj = Math.min(grid.rows - 1, bj + step);
-      for (let bi = 0; bi + 1 < grid.columns; bi = bi + step) {
-        const ti = Math.min(grid.columns - 1, bi + step);
-        let whole = true;
-        let any = false;
-        for (let j = bj; j < tj && whole; j++) {
-          for (let i = bi; i < ti; i++) {
-            const list = cells.get(copy + ':' + String(i) + ':' + String(j));
-            if (list === undefined || list.length !== 2) {
-              whole = false;
-            }
-            if (list !== undefined) {
-              any = true;
-            }
-          }
-        }
-        const a = corners.get(copy + ':' + String(bi) + ':' + String(bj));
-        const b = corners.get(copy + ':' + String(ti) + ':' + String(bj));
-        const d = corners.get(copy + ':' + String(ti) + ':' + String(tj));
-        const e = corners.get(copy + ':' + String(bi) + ':' + String(tj));
-        if (whole && a !== undefined && b !== undefined && d !== undefined && e !== undefined) {
-          const x0 = grid.xs[bi];
-          const x1 = grid.xs[ti];
-          const y0 = grid.ys[bj];
-          const y1 = grid.ys[tj];
-          result.push({ page: [a[0], a[1], b[0], b[1], d[0], d[1]], decal: [x0, y0, x1, y0, x1, y1], copy: copies[c] });
-          result.push({ page: [a[0], a[1], d[0], d[1], e[0], e[1]], decal: [x0, y0, x1, y1, x0, y1], copy: copies[c] });
-          continue;
-        }
-        if (!any) {
-          continue;
-        }
-        for (let j = bj; j < tj; j++) {
-          for (let i = bi; i < ti; i++) {
-            const list = cells.get(copy + ':' + String(i) + ':' + String(j));
-            if (list === undefined) {
-              continue;
-            }
-            for (let k = 0; k < list.length; k++) {
-              result.push(list[k]);
-            }
-          }
-        }
-      }
-    }
-  }
-  return result;
 }
 
 // A closed polygon as path data text.

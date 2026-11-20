@@ -151,6 +151,15 @@ function moveSubtreeInPlace(doc: AssemblyDocument, id: string, transform: RigidT
   }
 }
 
+// Move one part and everything below it by a rigid motion (new = motion *
+// old), leaving its symmetry partners where they are.
+export function moveSubtreeBy(doc: AssemblyDocument, id: string, motion: RigidTransform): AssemblyDocument {
+  const next = cloneDocument(doc);
+  const placed = requirePlaced(next, id);
+  moveSubtreeInPlace(next, id, compose(motion, placed.transform));
+  return next;
+}
+
 // Move a part to a new world transform. Its descendants come with it, and its
 // symmetry partners take the same pose turned about the axis.
 export function movePart(doc: AssemblyDocument, id: string, transform: RigidTransform): AssemblyDocument {

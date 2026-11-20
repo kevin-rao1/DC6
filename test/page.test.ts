@@ -10,7 +10,12 @@ import { raycastSurface, worldNormal } from '../src/geometry/geodesic.ts';
 import type { Surface } from '../src/geometry/geodesic.ts';
 import { defaultRight, frameAt, mapDecal, rotateInPlane } from '../src/geometry/decal-map.ts';
 import type { Page, PageView } from '../src/geometry/page.ts';
-import { buildPage, decalPageTriangles, edgeJoint, islandGap, pageToSurface, surfaceToPage, viewPage } from '../src/geometry/page.ts';
+import { buildPage, decalPageTriangles, edgeJoint, islandGap, pageToSurface, rasterTriangles, surfaceToPage, viewPage } from '../src/geometry/page.ts';
+import { anchorOf, frameOf } from '../src/geometry/decal-map.ts';
+import { nearestOnSurface, pieceIndex } from '../src/geometry/geodesic.ts';
+import { emptyDocument } from '../src/model/document.ts';
+import { addDecal, decalGroup } from '../src/model/decals.ts';
+import { setDecalSymmetry } from '../src/model/decal-symmetry.ts';
 import { AFT_DIRECTION } from '../src/geometry/rocket-axis.ts';
 import { assembledRocket, fusedRocket, infoOf } from './rocket.ts';
 import { readFileSync } from 'node:fs';
@@ -28,6 +33,19 @@ import { placeRoot } from '../src/geometry/mating.ts';
 import { body, tube as tubeSize } from '../tools/test-model-dimensions.ts';
 
 const report: string[] = [];
+
+function longestEdge(p: number[]): number {
+  let longest = 0;
+  for (let k = 0; k < 3; k++) {
+    const kk = (k + 1) % 3;
+    longest = Math.max(longest, Math.hypot(p[2 * k] - p[2 * kk], p[2 * k + 1] - p[2 * kk + 1]));
+  }
+  return longest;
+}
+
+function triangleArea(p: number[]): number {
+  return Math.abs((p[2] - p[0]) * (p[5] - p[1]) - (p[4] - p[0]) * (p[3] - p[1])) / 2;
+}
 
 function page1(page: Page, piece: number): string {
   return page.placedIds[piece];
@@ -614,6 +632,71 @@ describe('decals on the page', () => {
     }
     expect(above).toBeGreaterThan(0);
     expect(below).toBeGreaterThan(0);
+  });
+
+  it('x4 round the tube: each copy is drawn in its own place, whole, at its own size (the one across the seam too)', async () => {
+    const rocket = await assembledRocket('tube');
+    const page = buildPage(rocket.surface, rocket.info);
+    const view = viewPage(page, 0);
+    const logo = importSvg(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'test-models', 'art', 'logo.svg'), 'utf8'), 'logo', 'a1').artwork as Artwork;
+    const s = rocket.surface;
+    const found = nearestOnSurface(s, [-150, 0, body.outerRadius], null, 5, [pieceIndex(s, 'tube')]);
+    if (found === null) {
+      throw new Error('no tube');
+    }
+    const start = frameAt(s, found.at, defaultRight(worldNormal(s, found.at)));
+    if (start === null) {
+      throw new Error('no frame');
+    }
+    const stored = anchorOf(s, start);
+    const added = addDecal(emptyDocument(), { name: 'logo', artworkId: 'a1', anchor: stored.anchor, rotation: stored.rotation, width: 40, height: 40, flipX: false, flipY: false, hidden: false, locked: false, colourMap: {}, symmetry: null });
+    const set = setDecalSymmetry(added.doc, s, added.id, 4, false, false);
+    const members = decalGroup(set.doc, added.id);
+    expect(members.length).toBe(4);
+    let stripArea = 0;
+    let coarseArea = 0;
+    let longestFine = 0;
+    let longestCoarse = 0;
+    let longestOutlineStep = 0;
+    for (let m = 0; m < members.length; m++) {
+      const frame = frameOf(s, members[m].anchor, members[m].rotation);
+      if (frame === null) {
+        throw new Error('no frame');
+      }
+      const grid = mapDecal(s, frame, 40, 40, 1);
+      const triangles = decalPageTriangles(view, grid);
+      // The bitmap at a low resolution (blocks of 6 cells) and a high one.
+      const coarse = rasterTriangles(grid, triangles, 1);
+      expect(rasterTriangles(grid, triangles, 24).length).toBe(triangles.length);
+      for (let t = 0; t < triangles.length; t++) {
+        longestFine = Math.max(longestFine, longestEdge(triangles[t].page));
+        if (triangles[t].copy === 0) {
+          stripArea = stripArea + triangleArea(triangles[t].page);
+        }
+      }
+      for (let t = 0; t < coarse.length; t++) {
+        longestCoarse = Math.max(longestCoarse, longestEdge(coarse[t].page));
+        if (coarse[t].copy === 0) {
+          coarseArea = coarseArea + triangleArea(coarse[t].page);
+        }
+      }
+      const shapes = decalOutlines(grid, triangles, logo, { width: 40, height: 40, flipX: false, flipY: false, colourMap: {} });
+      for (let k = 0; k < shapes.length; k++) {
+        for (let o = 0; o < shapes[k].outlines.length; o++) {
+          const points = shapes[k].outlines[o].points;
+          for (let q = 2; q < points.length; q = q + 2) {
+            longestOutlineStep = Math.max(longestOutlineStep, Math.hypot(points[q] - points[q - 2], points[q + 1] - points[q - 1]));
+          }
+        }
+      }
+    }
+    report.push('x4 logo on the page: copies cover ' + stripArea.toFixed(0) + ' mm² on the strip (4 x 1600 = 6400); longest triangle edge ' + longestFine.toFixed(2) + ' mm fine, ' + longestCoarse.toFixed(2) + ' mm in blocks; longest outline step ' + longestOutlineStep.toFixed(2) + ' mm');
+    expect(longestFine).toBeLessThan(2);
+    // Blocks of at most 6 x 6 one-millimetre cells.
+    expect(longestCoarse).toBeLessThan(10);
+    expect(longestOutlineStep).toBeLessThan(3);
+    expect(Math.abs(stripArea - 4 * 1600)).toBeLessThan(4 * 1600 * 0.01);
+    expect(Math.abs(coarseArea - 4 * 1600)).toBeLessThan(4 * 1600 * 0.02);
   });
 
   it('a band longer than the circumference shows its overlap on the page', async () => {
