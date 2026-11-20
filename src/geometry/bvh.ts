@@ -156,6 +156,41 @@ function rayTriangle(positions: Float32Array, indices: Uint32Array, t: number, o
   return distance;
 }
 
+// Every triangle whose bounding box comes within `radius` of `point` (a
+// superset of the triangles within that distance; the caller measures).
+// Used to find where a decal continues onto a neighbouring part.
+export function trianglesNear(bvh: Bvh, point: Vec3, radius: number): number[] {
+  const result: number[] = [];
+  if (bvh.nodes.length === 0) {
+    return result;
+  }
+  const stack: number[] = [0];
+  while (stack.length > 0) {
+    const node = stack.pop() as number;
+    let outside = false;
+    for (let axis = 0; axis < 3; axis++) {
+      if (point[axis] < bvh.bounds[6 * node + axis] - radius || point[axis] > bvh.bounds[6 * node + 3 + axis] + radius) {
+        outside = true;
+        break;
+      }
+    }
+    if (outside) {
+      continue;
+    }
+    const first = bvh.nodes[2 * node];
+    const count = bvh.nodes[2 * node + 1];
+    if (count > 0) {
+      for (let k = first; k < first + count; k++) {
+        result.push(bvh.order[k]);
+      }
+    } else {
+      stack.push(first);
+      stack.push(node + 1);
+    }
+  }
+  return result;
+}
+
 // The nearest hit of a ray (direction must be unit length), or null.
 export function raycast(
   bvh: Bvh,
