@@ -138,8 +138,8 @@ describe('cut export', () => {
     const logo = testArt('logo');
     const lettering = testArt('lettering');
     const pieces: CutPiece[] = [
-      { name: 'logo', artwork: logo, width: 30, height: 30, flipX: false, flipY: false, colourMap: {} },
-      { name: 'DC6', artwork: lettering, width: 120, height: 40, flipX: true, flipY: false, colourMap: {} },
+      { name: 'logo', artwork: logo, width: 30, height: 30, flipX: false, flipY: false, colourMap: {}, quantity: 1 },
+      { name: 'DC6', artwork: lettering, width: 120, height: 40, flipX: true, flipY: false, colourMap: {}, quantity: 1 },
     ];
     const files = cutFiles(pieces, { files: 'layers', overlaps: 'layered' });
     expect(files.length).toBe(1);
@@ -171,7 +171,7 @@ describe('cut export', () => {
 
   it('writes one file per colour, each plain', () => {
     const logo = testArt('logo');
-    const pieces: CutPiece[] = [{ name: 'logo', artwork: logo, width: 40, height: 40, flipX: false, flipY: false, colourMap: {} }];
+    const pieces: CutPiece[] = [{ name: 'logo', artwork: logo, width: 40, height: 40, flipX: false, flipY: false, colourMap: {}, quantity: 1 }];
     const files = cutFiles(pieces, { files: 'per-colour', overlaps: 'layered' });
     expect(files.map((f) => f.fileName)).toEqual(['dc6-cut-cerise.svg', 'dc6-cut-black.svg']);
     for (let i = 0; i < files.length; i++) {
@@ -182,7 +182,7 @@ describe('cut export', () => {
 
   it('knocks out the overlap from the lower colour, with the right area', () => {
     const logo = testArt('logo');
-    const piece: CutPiece = { name: 'logo', artwork: logo, width: 40, height: 40, flipX: false, flipY: false, colourMap: {} };
+    const piece: CutPiece = { name: 'logo', artwork: logo, width: 40, height: 40, flipX: false, flipY: false, colourMap: {}, quantity: 1 };
     const entry = { piece: piece, x: 0, y: 0 };
     const cerise = colourPaths(entry, '#e64097', 'knockout');
     let ceriseArea = 0;
@@ -206,7 +206,7 @@ describe('cut export', () => {
     const black = colourPaths(entry, '#000000', 'knockout');
     expect(black.length).toBe(1);
     // Remapping both artwork colours to one vinyl colour leaves nothing to knock out.
-    const merged: CutPiece = { name: 'logo', artwork: logo, width: 40, height: 40, flipX: false, flipY: false, colourMap: { '#000000': '#e64097' } };
+    const merged: CutPiece = { name: 'logo', artwork: logo, width: 40, height: 40, flipX: false, flipY: false, colourMap: { '#000000': '#e64097' }, quantity: 1 };
     const files = cutFiles([merged], { files: 'per-colour', overlaps: 'knockout' });
     expect(files.length).toBe(1);
     checkPlain(files[0].text);

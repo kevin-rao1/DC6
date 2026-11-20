@@ -41,9 +41,18 @@ export interface Download {
   path(): Promise<string>;
 }
 
+export interface FileChooser {
+  setFiles(files: string | string[]): Promise<void>;
+}
+
 export interface Page {
   goto(url: string): Promise<unknown>;
-  screenshot(options: { path: string }): Promise<unknown>;
+  reload(): Promise<unknown>;
+  close(): Promise<void>;
+  content(): Promise<string>;
+  setContent(html: string): Promise<void>;
+  addInitScript(script: () => void): Promise<void>;
+  screenshot(options: { path: string; fullPage?: boolean }): Promise<unknown>;
   waitForTimeout(milliseconds: number): Promise<void>;
   waitForFunction(callback: () => boolean): Promise<unknown>;
   evaluate<R>(callback: () => R | Promise<R>): Promise<R>;
@@ -51,6 +60,9 @@ export interface Page {
   locator(selector: string): Locator;
   on(event: 'pageerror', listener: (error: Error) => void): void;
   waitForEvent(event: 'download'): Promise<Download>;
+  waitForEvent(event: 'filechooser'): Promise<FileChooser>;
+  waitForEvent(event: 'popup'): Promise<Page>;
+  waitForLoadState(state: 'load'): Promise<void>;
   mouse: Mouse;
   keyboard: Keyboard;
 }

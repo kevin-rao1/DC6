@@ -129,6 +129,48 @@ export class View {
     this.requestRender();
   }
 
+  // A picture of the view as it is, `scale` times its size on screen, as
+  // PNG; with a transparent background if asked. `hide`: overlays to leave
+  // out (handles, markers, the gizmo).
+  snapshot(scale: number, transparent: boolean, hide: THREE.Object3D[]): Promise<Blob> {
+    const width = Math.max(1, this.canvas.clientWidth);
+    const height = Math.max(1, this.canvas.clientHeight);
+    const ratio = this.renderer.getPixelRatio();
+    const wasVisible: boolean[] = [];
+    for (let i = 0; i < hide.length; i++) {
+      wasVisible.push(hide[i].visible);
+      hide[i].visible = false;
+    }
+    this.renderer.setPixelRatio(scale);
+    this.renderer.setSize(width, height, false);
+    if (transparent) {
+      this.renderer.setClearColor(0x000000, 0);
+    }
+    this.fitDepthRange();
+    this.renderer.render(this.scene, this.camera);
+    // The drawing buffer is read now, in the same task as the render.
+    const canvas = this.canvas;
+    const picture = new Promise<Blob>(function read(resolve, reject) {
+      canvas.toBlob(function made(blob) {
+        if (blob === null) {
+          reject(new Error('the view could not be turned into a picture'));
+        } else {
+          resolve(blob);
+        }
+      }, 'image/png');
+    });
+    this.renderer.setClearColor(0x000000, 1);
+    this.renderer.setPixelRatio(ratio);
+    this.renderer.setSize(width, height, false);
+    this.canvas.style.width = width + 'px';
+    this.canvas.style.height = height + 'px';
+    for (let i = 0; i < hide.length; i++) {
+      hide[i].visible = wasVisible[i];
+    }
+    this.requestRender();
+    return picture;
+  }
+
   requestRender(): void {
     if (this.renderPending) {
       return;

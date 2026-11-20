@@ -14,7 +14,10 @@
 //     rocket. (Rays from the inner struts of a can hit the can's wall; the
 //     bottom of the can's internals, seen up the open tail of a hollow tube,
 //     has the tube's inside in front of it; rays from a fin's side get away,
-//     except near the root of a fin with close neighbours.)
+//     except near the root of a fin with close neighbours.) Only parts on
+//     the body (the root and what is attached to it, however indirectly)
+//     can block a ray: a part left floating beside the rocket, not yet put
+//     on, must not hide the fin it happens to be next to.
 //
 // Orientation, as the brief asks: seen from outside, the nose direction is
 // to the left. Then there is no choice left for a rigid, unmirrored
@@ -26,7 +29,7 @@ import type { Vec3 } from './vec3.ts';
 import { cross, dot, length, normalize, scale, sub } from './vec3.ts';
 import type { CadFace } from './part.ts';
 import { applyToDirection, applyToPoint } from './transform.ts';
-import type { Surface } from './geodesic.ts';
+import type { Surface, SurfacePiece } from './geodesic.ts';
 import { raycastSurface } from './geodesic.ts';
 import { meshVertex } from './surface-mesh.ts';
 import { AFT_DIRECTION, NOSE_DIRECTION, WORLD_UP } from './rocket-axis.ts';
@@ -50,6 +53,9 @@ export interface PieceInfo {
   triangleFace: Uint32Array;
   // 1-based number in its symmetry set, or null if it is not in one.
   symmetryNumber: number | null;
+  // The part is on the body: the root, or attached to it through its
+  // parents. Only these block the outward rays.
+  onBody: boolean;
 }
 
 export type IslandKind = 'side' | 'end';
@@ -59,6 +65,12 @@ export interface Island {
   face: number;
   kind: IslandKind;
   label: string;
+  // For a side of a two-sided part (a fin): 'left' or 'right' (see
+  // sideName); '' otherwise.
+  side: string;
+  // Which way from the island its label goes on the page: 1 above it, -1
+  // below it (set by the layout, away from the strip).
+  labelSide: number;
   // The face's frame in the world: a point on it, its outward normal, and
   // the world directions of page right and page up on it.
   origin: Vec3;
@@ -130,6 +142,14 @@ function sideName(normal: Vec3, origin: Vec3): string {
 
 export function findIslands(surface: Surface, info: PieceInfo[], strip: Strip): Island[] {
   const islands: Island[] = [];
+  // The parts that can block the outward rays.
+  const blockerPieces: SurfacePiece[] = [];
+  for (let p = 0; p < surface.pieces.length; p++) {
+    if (info[p].onBody) {
+      blockerPieces.push(surface.pieces[p]);
+    }
+  }
+  const blockers: Surface = { pieces: blockerPieces };
   for (let p = 0; p < surface.pieces.length; p++) {
     const piece = surface.pieces[p];
     const mesh = piece.mesh;
@@ -159,7 +179,7 @@ export function findIslands(surface: Surface, info: PieceInfo[], strip: Strip): 
     for (let f = 0; f < faceNumbers.length; f++) {
       const face = faceNumbers[f];
       const triangles = byFace.get(face) as number[];
-      const island = makeIsland(surface, p, face, triangles, part, strip);
+      const island = makeIsland(surface, blockers, p, face, triangles, part, strip);
       if (island !== null) {
         islands.push(island);
       }
@@ -168,7 +188,7 @@ export function findIslands(surface: Surface, info: PieceInfo[], strip: Strip): 
   return islands;
 }
 
-function makeIsland(surface: Surface, p: number, face: number, triangles: number[], part: PieceInfo, strip: Strip): Island | null {
+function makeIsland(surface: Surface, blockers: Surface, p: number, face: number, triangles: number[], part: PieceInfo, strip: Strip): Island | null {
   const piece = surface.pieces[p];
   const mesh = piece.mesh;
   const cad = part.faces[face];
@@ -298,7 +318,7 @@ function makeIsland(surface: Surface, p: number, face: number, triangles: number
       if (Number.isFinite(bodyRadius) && radiusOf(inFront) < bodyRadius - radiusTolerance) {
         continue; // inside the body
       }
-      if (raycastSurface(surface, start, normal) === null) {
+      if (raycastSurface(blockers, start, normal) === null) {
         escaped = escaped + 1;
       }
     }
@@ -320,6 +340,8 @@ function makeIsland(surface: Surface, p: number, face: number, triangles: number
     face: face,
     kind: axes.kind,
     label: label,
+    side: axes.kind === 'side' ? side : '',
+    labelSide: 1,
     origin: origin,
     normal: normal,
     right: axes.right,

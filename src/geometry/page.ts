@@ -11,14 +11,16 @@
 // at the seam for that roll). Building is a pure function of the assembly:
 // the same assembly gives the same page.
 //
-// Layout (by meaning, not packing): the strip lies along y = 0 with the
-// nose at x = 0. Islands of faces on the side of the rocket sit above the
-// strip if they face the top half (roll 0 to pi) and below it otherwise,
-// at the station of their middle, nearest roll to the side view first,
-// each stacked clear of the strip (including its repeat band) and of the
-// islands already placed, an even gap apart. End faces sit beyond the end
-// of the strip they face, at their station, centred on the strip's line if
-// that is free.
+// Layout: the strip lies along y = 0 with the nose at x = 0. Islands of
+// faces on the side of the rocket sit in one row above the strip (those
+// facing the top half, roll 0 to pi) and one row below it, clear of the
+// strip's repeat band, an even gap apart. The sides of one part sit side
+// by side (left, then right, seen from the tail). Each part's islands
+// start at its own station and move along the row, aft or forward, to the
+// nearest free place; the part nearest the side view goes first. So the
+// page is about as tall as the strip and one row of islands on each side.
+// End faces sit beyond the end of the strip they face, at their station,
+// centred on the strip's line if that is free, else in the row above.
 
 import type { Vec3 } from './vec3.ts';
 import type { Surface } from './geodesic.ts';
@@ -153,15 +155,19 @@ function islandBox(island: Island): Box {
   };
 }
 
-function overlapsInX(a: Box, from: number, to: number): boolean {
-  return a.maxX > from && a.minX < to;
-}
-
 function layOut(page: Page): void {
   const islands = page.islands;
   const profile = page.strip.profile;
-  const above: number[] = [];
-  const below: number[] = [];
+  // The strip band's half height (strip and repeat band) at its widest:
+  // the rows of islands run straight along above and below it.
+  let bandHalf = 0;
+  for (let b = 0; b < page.envelope.length; b++) {
+    bandHalf = Math.max(bandHalf, page.envelope[b]);
+  }
+  const rowEdge = bandHalf + islandGap;
+  // Side islands, grouped by part and by row: the sides of one fin go
+  // together, side by side.
+  const blocks: Block[] = [];
   const ends: number[] = [];
   for (let i = 0; i < islands.length; i++) {
     const island = islands[i];
@@ -177,32 +183,83 @@ function layOut(page: Page): void {
       ends.push(i);
       continue;
     }
-    // Side islands: the origin (the face's middle) at its station.
-    island.offsetX = arc;
-    if (island.roll >= 0) {
-      above.push(i);
-    } else {
-      below.push(i);
+    // Side islands: above the strip if they face the top half.
+    const row = island.roll >= 0 ? 1 : -1;
+    let block: Block | null = null;
+    for (let k = 0; k < blocks.length; k++) {
+      if (blocks[k].piece === island.piece && blocks[k].row === row) {
+        block = blocks[k];
+      }
+    }
+    if (block === null) {
+      block = { piece: island.piece, row: row, members: [], preferred: Infinity, width: 0, roll: island.roll };
+      blocks.push(block);
+    }
+    block.members.push(i);
+    // Where the island's left edge would be with its middle at its station.
+    block.preferred = Math.min(block.preferred, arc + island.minX);
+  }
+  for (let k = 0; k < blocks.length; k++) {
+    const block = blocks[k];
+    // Left side first, then right (as seen from the tail), then by face.
+    block.members.sort(function bySide(a, b) {
+      const sideA = islands[a].side === 'right' ? 1 : 0;
+      const sideB = islands[b].side === 'right' ? 1 : 0;
+      if (sideA !== sideB) {
+        return sideA - sideB;
+      }
+      return islands[a].face - islands[b].face;
+    });
+    let width = 0;
+    for (let m = 0; m < block.members.length; m++) {
+      const island = islands[block.members[m]];
+      if (m > 0) {
+        width = width + islandGap;
+      }
+      width = width + island.maxX - island.minX;
+    }
+    block.width = width;
+  }
+  // Nearest the side view first: they get their own station.
+  blocks.sort(function nearestFirst(a, b) {
+    if (a.row !== b.row) {
+      return b.row - a.row;
+    }
+    return Math.abs(a.roll) - Math.abs(b.roll);
+  });
+  const rows: Record<string, Array<[number, number]>> = { '1': [], '-1': [] };
+  const stripStart = 0;
+  const stripEnd = page.strip.length;
+  for (let k = 0; k < blocks.length; k++) {
+    const block = blocks[k];
+    const taken = rows[String(block.row)];
+    const left = freeSpot(taken, block.preferred, block.width, stripStart, stripEnd);
+    taken.push([left, left + block.width]);
+    let x = left;
+    for (let m = 0; m < block.members.length; m++) {
+      const island = islands[block.members[m]];
+      island.offsetX = x - island.minX;
+      if (block.row > 0) {
+        island.offsetY = rowEdge - island.minY;
+      } else {
+        island.offsetY = -rowEdge - island.maxY;
+      }
+      island.labelSide = block.row;
+      x = x + island.maxX - island.minX + islandGap;
     }
   }
-  above.sort(function nearestFirst(a, b) {
-    return islands[a].roll - islands[b].roll;
-  });
-  below.sort(function nearestFirst(a, b) {
-    return islands[b].roll - islands[a].roll;
-  });
   const placed: Box[] = [];
-  for (let k = 0; k < above.length; k++) {
-    stack(page, islands[above[k]], placed, 1);
-    placed.push(islandBox(islands[above[k]]));
+  for (let i = 0; i < islands.length; i++) {
+    if (islands[i].kind === 'side') {
+      placed.push(islandBox(islands[i]));
+    }
   }
-  for (let k = 0; k < below.length; k++) {
-    stack(page, islands[below[k]], placed, -1);
-    placed.push(islandBox(islands[below[k]]));
-  }
+  // End faces: beyond the end of the strip they face, on its middle line
+  // if that is free; else in the row above.
   for (let k = 0; k < ends.length; k++) {
     const island = islands[ends[k]];
     island.offsetY = -(island.minY + island.maxY) / 2;
+    island.labelSide = -1;
     const box = islandBox(island);
     let clear = envelopeOver(page, box.minX - islandGap, box.maxX + islandGap) === 0;
     for (let q = 0; q < placed.length && clear; q++) {
@@ -213,18 +270,21 @@ function layOut(page: Page): void {
       }
     }
     if (!clear) {
-      stack(page, island, placed, 1);
+      const taken = rows['1'];
+      const width = island.maxX - island.minX;
+      const left = freeSpot(taken, island.offsetX + island.minX, width, stripStart, stripEnd);
+      taken.push([left, left + width]);
+      island.offsetX = left - island.minX;
+      island.offsetY = rowEdge - island.minY;
+      island.labelSide = 1;
     }
     placed.push(islandBox(island));
   }
   // Bounds: the strip band and every island.
   let minX = 0;
   let maxX = page.strip.length;
-  let maxY = 0;
-  for (let b = 0; b < page.envelope.length; b++) {
-    maxY = Math.max(maxY, page.envelope[b]);
-  }
-  let minY = -maxY;
+  let maxY = bandHalf;
+  let minY = -bandHalf;
   for (let q = 0; q < placed.length; q++) {
     minX = Math.min(minX, placed[q].minX);
     maxX = Math.max(maxX, placed[q].maxX);
@@ -237,29 +297,51 @@ function layOut(page: Page): void {
   page.maxY = maxY;
 }
 
-// Put an island above (direction 1) or below (-1) the strip, clear of the
-// strip band and of the boxes already placed on that side, an even gap away.
-function stack(page: Page, island: Island, placed: Box[], direction: number): void {
-  const from = island.minX + island.offsetX - islandGap;
-  const to = island.maxX + island.offsetX + islandGap;
-  let edge = envelopeOver(page, from, to) + islandGap;
-  for (let q = 0; q < placed.length; q++) {
-    const box = placed[q];
-    if (!overlapsInX(box, from, to)) {
+// The islands of one part in one row, laid side by side.
+interface Block {
+  piece: number;
+  row: number;
+  members: number[];
+  // Left edge it would have at its own station, and its width (mm).
+  preferred: number;
+  width: number;
+  roll: number;
+}
+
+// Where in a row a block of this width goes: the free place nearest its
+// own station, an even gap from the blocks already there. Going past the
+// ends of the strip counts double, so a block moves along over the strip
+// rather than off its end when both are as near.
+function freeSpot(taken: Array<[number, number]>, preferred: number, width: number, stripStart: number, stripEnd: number): number {
+  const candidates: number[] = [preferred];
+  for (let i = 0; i < taken.length; i++) {
+    candidates.push(taken[i][1] + islandGap);
+    candidates.push(taken[i][0] - islandGap - width);
+  }
+  let best = preferred;
+  let bestCost = Infinity;
+  for (let c = 0; c < candidates.length; c++) {
+    const left = candidates[c];
+    const right = left + width;
+    let free = true;
+    for (let i = 0; i < taken.length; i++) {
+      // Touching at exactly the gap is allowed (a hair of rounding aside).
+      if (left < taken[i][1] + islandGap - 1e-9 && right > taken[i][0] - islandGap + 1e-9) {
+        free = false;
+        break;
+      }
+    }
+    if (!free) {
       continue;
     }
-    if (direction > 0 && box.maxY > 0) {
-      edge = Math.max(edge, box.maxY + islandGap);
-    }
-    if (direction < 0 && box.minY < 0) {
-      edge = Math.max(edge, -box.minY + islandGap);
+    const overhang = Math.max(0, stripStart - left) + Math.max(0, right - stripEnd);
+    const cost = Math.abs(left - preferred) + overhang;
+    if (cost < bestCost - 1e-9) {
+      bestCost = cost;
+      best = left;
     }
   }
-  if (direction > 0) {
-    island.offsetY = edge - island.minY;
-  } else {
-    island.offsetY = -edge - island.maxY;
-  }
+  return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +788,11 @@ export function decalPageTriangles(view: PageView, grid: DecalGrid): DecalPageTr
     }
     const triangle = grid.triangles[k];
     const mesh = page.surface.pieces[pagePiece].mesh;
+    if (triangle >= mesh.triangles.length / 3) {
+      // The page is of an older assembly (a part was replaced since).
+      points.push(null);
+      continue;
+    }
     const local: Vec3 = [grid.locals[3 * k], grid.locals[3 * k + 1], grid.locals[3 * k + 2]];
     const w = barycentricOf(mesh, triangle, local);
     const key = triangleKey(pagePiece, triangle);

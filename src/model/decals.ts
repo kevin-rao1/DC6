@@ -36,6 +36,29 @@ export interface Decal {
   locked: boolean;
   // Artwork colour -> vinyl colour, for colours the user has remapped.
   colourMap: Record<string, string>;
+  // Linked copies round the rocket and mirror images (decal-symmetry.ts);
+  // null for a decal on its own.
+  symmetry: DecalSymmetry | null;
+}
+
+// A decal's place in a set of linked copies (brief v1 4.5). Every member
+// carries the set's settings (count, mirror, flipMirror) as well as its own
+// place in it, so any member can stand for the set.
+export interface DecalSymmetry {
+  // Members of one set share the group id.
+  group: string;
+  // Copies round the rocket axis, evenly spaced (1: none).
+  count: number;
+  // Each copy also has a mirror image on the other side of the vertical
+  // plane through the axis.
+  mirror: boolean;
+  // Mirror images show the artwork mirrored; otherwise lettering on them
+  // still reads the right way round.
+  flipMirror: boolean;
+  // This member: member 0 turned index/count of a turn about the axis,
+  // and reflected first if `mirrored`.
+  index: number;
+  mirrored: boolean;
 }
 
 // The vinyl colours always offered.
@@ -99,6 +122,57 @@ export function removeDecal(doc: AssemblyDocument, id: string): AssemblyDocument
   return next;
 }
 
+// The members of a decal's symmetry set in layer order (just the decal if
+// it has none).
+export function decalGroup(doc: AssemblyDocument, id: string): Decal[] {
+  const decal = requireDecal(doc, id);
+  if (decal.symmetry === null) {
+    return [decal];
+  }
+  const group = decal.symmetry.group;
+  const members: Decal[] = [];
+  for (let i = 0; i < doc.decals.length; i++) {
+    const other = doc.decals[i];
+    if (other.symmetry !== null && other.symmetry.group === group) {
+      members.push(other);
+    }
+  }
+  return members;
+}
+
+// Remove a decal and its linked copies.
+export function removeDecalGroup(doc: AssemblyDocument, id: string): AssemblyDocument {
+  const members = decalGroup(doc, id);
+  const doomed = new Set<string>();
+  for (let i = 0; i < members.length; i++) {
+    doomed.add(members[i].id);
+  }
+  const next = cloneDocument(doc);
+  const kept: Decal[] = [];
+  for (let i = 0; i < next.decals.length; i++) {
+    if (!doomed.has(next.decals[i].id)) {
+      kept.push(next.decals[i]);
+    }
+  }
+  next.decals = kept;
+  return next;
+}
+
+// Put the decals in this order (bottom layer first). Every decal must be
+// listed once.
+export function reorderDecals(doc: AssemblyDocument, bottomFirst: string[]): AssemblyDocument {
+  if (bottomFirst.length !== doc.decals.length) {
+    throw new Error('reorderDecals: expected ' + String(doc.decals.length) + ' ids, got ' + String(bottomFirst.length));
+  }
+  const next = cloneDocument(doc);
+  const ordered: Decal[] = [];
+  for (let i = 0; i < bottomFirst.length; i++) {
+    ordered.push(requireDecal(next, bottomFirst[i]));
+  }
+  next.decals = ordered;
+  return next;
+}
+
 // Put a decal at layer `index` (0 = bottom).
 export function moveDecalLayer(doc: AssemblyDocument, id: string, index: number): AssemblyDocument {
   const next = cloneDocument(doc);
@@ -121,6 +195,7 @@ export function duplicateDecal(doc: AssemblyDocument, id: string): { doc: Assemb
   copy.name = original.name + ' copy';
   copy.locked = false;
   copy.hidden = false;
+  copy.symmetry = null;
   next.decals.splice(from + 1, 0, copy);
   return { doc: next, id: copy.id };
 }

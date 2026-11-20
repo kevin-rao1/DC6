@@ -16,6 +16,7 @@
 //     dragged, `shown` is a preview made from the committed document by the
 //     same operations a drop would commit, so what you see is what you get.
 
+import type * as THREE from 'three';
 import type { Part } from '../geometry/part.ts';
 import type { Vec3 } from '../geometry/vec3.ts';
 import { add, cross, dot, scale, sub } from '../geometry/vec3.ts';
@@ -48,6 +49,8 @@ import { findStackPair, freeFaces } from './stack-snap.ts';
 import { faceOnFace, faceOnSurface, rootOnFace } from './place-on-face.ts';
 import { PartGizmo } from './gizmo.ts';
 import { DecalTool } from './decal-tool.ts';
+import type { ReattachReport } from '../model/replace-part.ts';
+import { reattachDecals, swapPart } from '../model/replace-part.ts';
 import type { Decal } from '../model/decals.ts';
 import type { SurfacePoint } from '../geometry/geodesic.ts';
 
@@ -128,6 +131,9 @@ export type LastOperation =
 export interface EditorEvents {
   // Something the panels show has changed.
   changed(): void;
+  // Only what is drawn changed (a decal being dragged): the views redraw,
+  // the panels (which show the committed document) need not.
+  previewed?(): void;
 }
 
 export class Editor {
@@ -175,6 +181,7 @@ export class Editor {
   private press: Press | null = null;
   private updateQueued = false;
   private readonly listeners: EditorEvents[] = [];
+  private readonly reporters: Array<(text: string) => void> = [];
 
   constructor(container: HTMLElement) {
     this.view = new View(container);
@@ -260,14 +267,101 @@ export class Editor {
     }
   }
 
+  // Something the user should be told in a few words (a toast).
+  onReport(callback: (text: string) => void): void {
+    this.reporters.push(callback);
+  }
+
+  report(text: string): void {
+    for (let i = 0; i < this.reporters.length; i++) {
+      this.reporters[i](text);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Parts and documents.
 
-  addPart(part: Part): void {
+  // A loaded part. Listed in the parts list unless `listed` is false (a
+  // part a project still uses, replaced in the list by a revised file).
+  addPart(part: Part, listed = true): void {
     this.parts.set(part.id, part);
-    this.partOrder.push(part.id);
+    if (listed && this.partOrder.indexOf(part.id) < 0) {
+      this.partOrder.push(part.id);
+    }
     this.geometries.set(part.id, makePartGeometry(part));
     this.notify();
+  }
+
+  // Forget everything: parts, artwork, the document and its history (New,
+  // or before a project is opened).
+  clearAll(): void {
+    this.held = null;
+    this.decals.reset();
+    this.lastOperation = null;
+    this.selectedId = null;
+    this.chosenFace = null;
+    this.hoverId = null;
+    this.hoverFace = null;
+    this.parts.clear();
+    this.partOrder.length = 0;
+    this.geometries.clear();
+    const self = this;
+    this.visuals.forEach(function remove(entry) {
+      self.view.partsGroup.remove(entry.visual.group);
+      entry.visual.dispose();
+    });
+    this.visuals.clear();
+    this.history.reset(emptyDocument());
+    this.tool = 'place';
+    this.symmetryCount = 1;
+    this.showCommitted();
+  }
+
+  // Show an opened project's document, with nothing to undo.
+  loadDocument(doc: AssemblyDocument): void {
+    this.history.reset(doc);
+    this.lastOperation = null;
+    this.selectedId = null;
+    this.showCommitted();
+  }
+
+  // Replace a loaded part by a revised one (one undo step): every placed
+  // part made from it keeps its place and takes the new geometry, and the
+  // decals on them are put on the new surface. Returns what the user
+  // should check.
+  replacePart(oldPartId: string, newPart: Part): ReattachReport[] {
+    const oldPart = requirePart(this.parts, oldPartId);
+    this.cancelHeld();
+    this.decals.cancel();
+    // A fresh id, so undo can go back to the old part (kept loaded).
+    let id = newPart.id;
+    let suffix = 2;
+    while (this.parts.has(id)) {
+      id = newPart.id + '~' + String(suffix);
+      suffix = suffix + 1;
+    }
+    newPart.id = id;
+    this.parts.set(id, newPart);
+    this.geometries.set(id, makePartGeometry(newPart));
+    const listed = this.partOrder.indexOf(oldPartId);
+    if (listed >= 0) {
+      this.partOrder[listed] = id;
+    } else {
+      this.partOrder.push(id);
+    }
+    const before = this.history.document;
+    const oldSurface = this.decals.surfaceFor(before);
+    const swapped = swapPart(before, oldPartId, id, oldPart, newPart);
+    const moved = new Set<string>();
+    for (let i = 0; i < swapped.placed.length; i++) {
+      if (swapped.placed[i].partId === id) {
+        moved.add(swapped.placed[i].id);
+      }
+    }
+    const newSurface = this.decals.surfaceFor(swapped);
+    const result = reattachDecals(swapped, oldSurface, newSurface, moved);
+    this.commit(result.doc);
+    return result.report;
   }
 
   get document(): AssemblyDocument {
@@ -334,7 +428,12 @@ export class Editor {
   previewDocument(doc: AssemblyDocument): void {
     this.shown = doc;
     this.syncScene();
-    this.notify();
+    for (let i = 0; i < this.listeners.length; i++) {
+      const previewed = this.listeners[i].previewed;
+      if (previewed !== undefined) {
+        previewed.call(this.listeners[i]);
+      }
+    }
   }
 
   // Redraw from the committed document (after a cancelled drag, a new selection).
@@ -373,7 +472,7 @@ export class Editor {
   undo(): void {
     this.lastOperation = null;
     this.cancelHeld();
-    this.decals.cancel();
+    this.decals.cancelActive();
     if (this.history.undo()) {
       this.showCommitted();
     }
@@ -382,7 +481,7 @@ export class Editor {
   redo(): void {
     this.lastOperation = null;
     this.cancelHeld();
-    this.decals.cancel();
+    this.decals.cancelActive();
     if (this.history.redo()) {
       this.showCommitted();
     }
@@ -1408,6 +1507,11 @@ export class Editor {
   }
 
   stepSymmetry(direction: number): void {
+    if (this.decals.selectedId !== null && this.held === null && !this.decals.isBusy()) {
+      // With a decal selected, ×N is the decal's: copies round the rocket.
+      this.decals.stepSymmetry(direction);
+      return;
+    }
     let index = symmetryChoices.indexOf(this.symmetryCount);
     if (index < 0) {
       index = 0;
@@ -1529,6 +1633,11 @@ export class Editor {
       }
       return;
     }
+    if (this.decals.selectedId !== null && key === 'm') {
+      // Mirror the selected decal to the other side (or stop mirroring it).
+      this.decals.toggleMirror();
+      return;
+    }
     if (this.decals.selectedId !== null && (key === 'h' || key === 'v')) {
       // Flip horizontally or vertically (Inkscape's keys).
       this.decals.flipSelected(key === 'h' ? 'x' : 'y');
@@ -1561,6 +1670,33 @@ export class Editor {
         this.turnHeld(WORLD_UP, -step);
       }
     }
+  }
+
+  // The visible parts as they are drawn: mesh, pose and preview colour
+  // (for the model export).
+  visibleMeshes(): Array<{ geometry: PartGeometry['mesh']; transform: RigidTransform; colour: string | null }> {
+    const result: Array<{ geometry: PartGeometry['mesh']; transform: RigidTransform; colour: string | null }> = [];
+    const doc = this.history.document;
+    for (let i = 0; i < doc.placed.length; i++) {
+      const placed = doc.placed[i];
+      const geometry = this.geometries.get(placed.partId);
+      if (placed.hidden || geometry === undefined) {
+        continue;
+      }
+      const colour = doc.partColours[placed.id];
+      result.push({ geometry: geometry.mesh, transform: placed.transform, colour: colour === undefined ? null : colour });
+    }
+    return result;
+  }
+
+  // A PNG of the 3D view without handles, markers or the gizmo.
+  viewPicture(scale: number, transparent: boolean): Promise<Blob> {
+    const hide: THREE.Object3D[] = [this.view.overlayGroup];
+    const gizmoObjects = this.gizmo.sceneObjects();
+    for (let i = 0; i < gizmoObjects.length; i++) {
+      hide.push(gizmoObjects[i]);
+    }
+    return this.view.snapshot(scale, transparent, hide);
   }
 
   isRoot(placedId: string): boolean {

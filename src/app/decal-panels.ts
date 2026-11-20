@@ -5,10 +5,14 @@
 import type { Editor } from './editor.ts';
 import type { AssemblyDocument } from '../model/document.ts';
 import type { Decal } from '../model/decals.ts';
-import { presetVinyl, vinylFor } from '../model/decals.ts';
+import { presetVinyl, requireDecal, vinylFor } from '../model/decals.ts';
 import { cutFiles } from '../geometry/cut-export.ts';
 import type { CutOptions, CutPiece } from '../geometry/cut-export.ts';
-import { findPlaced } from '../model/document.ts';
+import { cutPiecesOf } from '../model/cut-pieces.ts';
+import { downloadBlob, downloadText } from './downloads.ts';
+import type { PagePane } from './page-pane.ts';
+import type { Datum, Paper } from './exports.ts';
+import { modelGlb, pageSvg, placementSheet, printablePage } from './exports.ts';
 
 export function element<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, parent: HTMLElement | null): HTMLElementTagNameMap[K] {
   const created = document.createElement(tag);
@@ -168,18 +172,22 @@ export class LayerList {
     const doc = editor.document;
     this.panel.textContent = '';
     this.panel.style.display = doc.decals.length > 0 ? '' : 'none';
-    // Top layer first, as in drawing programs.
-    for (let layer = doc.decals.length - 1; layer >= 0; layer--) {
-      this.row(doc, doc.decals[layer]);
+    // Top layer first, as in drawing programs; a linked set is one row.
+    const entries = layerEntries(doc, editor.decals.selectedId);
+    for (let i = 0; i < entries.length; i++) {
+      this.row(doc, entries[i]);
     }
   }
 
-  private row(doc: AssemblyDocument, decal: Decal): void {
+  private row(doc: AssemblyDocument, entry: LayerEntry): void {
     const editor = this.editor;
     const self = this;
+    const decal = entry.decal;
     const row = element('div', 'tree-row layer-row', this.panel);
     row.dataset.decalId = decal.id;
-    row.classList.toggle('selected', editor.decals.selectedId === decal.id);
+    row.dataset.count = String(entry.ids.length);
+    const selectedId = editor.decals.selectedId;
+    row.classList.toggle('selected', selectedId !== null && entry.ids.indexOf(selectedId) >= 0);
     row.classList.toggle('hidden-part', decal.hidden);
     row.classList.toggle('locked', decal.locked);
     const artwork = editor.decals.artworks.get(decal.artworkId);
@@ -235,6 +243,11 @@ export class LayerList {
     } else {
       const name = element('span', 'tree-name', row);
       name.textContent = decal.name;
+      if (entry.ids.length > 1) {
+        const badge = element('span', 'badge', name);
+        badge.textContent = '×' + String(entry.ids.length);
+        badge.title = String(entry.ids.length) + ' linked copies';
+      }
       name.addEventListener('dblclick', function rename(event) {
         event.stopPropagation();
         self.renaming = decal.id;
@@ -338,86 +351,106 @@ export class LayerList {
       return;
     }
     const doc = this.editor.document;
-    const count = doc.decals.length;
-    // Gap g from the top sits above the layer count - 1 - g... convert to a
-    // bottom-up index among the other decals.
+    // The rows, top first; the dragged one comes out and goes in at the gap.
+    const entries = layerEntries(doc, this.editor.decals.selectedId);
     let from = -1;
-    for (let i = 0; i < count; i++) {
-      if (doc.decals[i].id === drag.id) {
+    for (let i = 0; i < entries.length; i++) {
+      if (entries[i].ids.indexOf(drag.id) >= 0) {
         from = i;
       }
     }
     if (from < 0) {
       return;
     }
-    const fromTop = count - 1 - from;
     let gap = drag.target;
-    if (gap > fromTop) {
+    if (gap > from) {
       gap = gap - 1; // the row itself is taken out first
     }
-    const index = count - 1 - gap;
-    if (index !== from) {
-      this.editor.decals.setLayer(drag.id, index);
-    } else {
+    if (gap === from) {
       this.refresh();
+      return;
+    }
+    const moving = entries[from];
+    entries.splice(from, 1);
+    entries.splice(gap, 0, moving);
+    // Back to bottom first.
+    const bottomFirst: string[] = [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const ids = entries[i].ids;
+      for (let k = 0; k < ids.length; k++) {
+        bottomFirst.push(ids[k]);
+      }
+    }
+    this.editor.decals.setLayers(bottomFirst);
+  }
+}
+
+// One row of the layer list: a decal, or a linked set of them.
+interface LayerEntry {
+  // The decal the row stands for (the selected member if one is).
+  decal: Decal;
+  // Every member, bottom first.
+  ids: string[];
+}
+
+// The rows of the layer list, top layer first. A set sits where its top
+// member is.
+function layerEntries(doc: AssemblyDocument, selectedId: string | null): LayerEntry[] {
+  const entries: LayerEntry[] = [];
+  const byGroup = new Map<string, LayerEntry>();
+  for (let layer = doc.decals.length - 1; layer >= 0; layer--) {
+    const decal = doc.decals[layer];
+    if (decal.symmetry === null) {
+      entries.push({ decal: decal, ids: [decal.id] });
+      continue;
+    }
+    const existing = byGroup.get(decal.symmetry.group);
+    if (existing === undefined) {
+      const entry: LayerEntry = { decal: decal, ids: [decal.id] };
+      byGroup.set(decal.symmetry.group, entry);
+      entries.push(entry);
+      continue;
+    }
+    existing.ids.unshift(decal.id);
+  }
+  // The row stands for the selected member, else for member 0.
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    for (let k = 0; k < entry.ids.length; k++) {
+      const decal = requireDecal(doc, entry.ids[k]);
+      if (decal.id === selectedId) {
+        entry.decal = decal;
+        break;
+      }
+      if (decal.symmetry !== null && decal.symmetry.index === 0 && !decal.symmetry.mirrored && entry.decal.id !== selectedId) {
+        entry.decal = decal;
+      }
     }
   }
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
 // Export.
 
-// The cut pieces of a document: every decal shown on a visible part.
+// The cut pieces of a document: every decal shown on a visible part, linked
+// copies once with a quantity.
 export function cutPieces(editor: Editor): CutPiece[] {
-  const doc = editor.document;
-  const pieces: CutPiece[] = [];
-  for (let i = 0; i < doc.decals.length; i++) {
-    const decal = doc.decals[i];
-    if (decal.hidden) {
-      continue;
-    }
-    const placed = findPlaced(doc, decal.anchor.placedId);
-    if (placed === null || placed.hidden) {
-      continue;
-    }
-    const artwork = editor.decals.artworks.get(decal.artworkId);
-    if (artwork === undefined) {
-      continue;
-    }
-    pieces.push({
-      name: decal.name,
-      artwork: artwork,
-      width: decal.width,
-      height: decal.height,
-      flipX: decal.flipX,
-      flipY: decal.flipY,
-      colourMap: decal.colourMap,
-    });
-  }
-  return pieces;
-}
-
-function download(fileName: string, text: string): void {
-  const blob = new Blob([text], { type: 'image/svg+xml' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = fileName;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  setTimeout(function release() {
-    URL.revokeObjectURL(url);
-  }, 10000);
+  return cutPiecesOf(editor.document, editor.decals.artworks);
 }
 
 export class ExportDialog {
   readonly box: HTMLDivElement;
   private readonly editor: Editor;
+  private readonly pagePane: PagePane;
   private options: CutOptions = { files: 'per-colour', overlaps: 'layered' };
+  private paper: Paper = 'A4';
+  private datum: Datum = 'aft';
+  private transparent = false;
 
-  constructor(parent: HTMLElement, editor: Editor) {
+  constructor(parent: HTMLElement, editor: Editor, pagePane: PagePane) {
     this.editor = editor;
+    this.pagePane = pagePane;
     this.box = element('div', 'export', parent);
     this.box.style.display = 'none';
     this.build();
@@ -432,41 +465,101 @@ export class ExportDialog {
   private build(): void {
     const self = this;
     this.box.textContent = '';
-    const title = element('div', 'adjust-title', this.box);
-    title.textContent = 'Cut file';
-    this.choice('files', [
-      ['per-colour', 'A file per colour'],
-      ['layers', 'One file, a layer per colour'],
+    this.heading('Cut file');
+    this.choice([
+      ['files:per-colour', 'A file per colour', this.options.files === 'per-colour'],
+      ['files:layers', 'One file, a layer per colour', this.options.files === 'layers'],
     ]);
-    this.choice('overlaps', [
-      ['layered', 'Colours layered'],
-      ['knockout', 'Overlaps knocked out'],
+    this.choice([
+      ['overlaps:layered', 'Colours layered', this.options.overlaps === 'layered'],
+      ['overlaps:knockout', 'Overlaps knocked out', this.options.overlaps === 'knockout'],
     ]);
     const go = element('button', 'primary', this.box);
-    go.textContent = 'Export';
+    go.textContent = 'Export cut file';
     go.dataset.action = 'export';
     go.addEventListener('click', function run() {
       self.run();
     });
+
+    this.heading('Placement sheet');
+    this.choice([
+      ['paper:A4', 'A4', this.paper === 'A4'],
+      ['paper:A3', 'A3', this.paper === 'A3'],
+      ['datum:aft', 'From aft end', this.datum === 'aft'],
+      ['datum:nose', 'From nose tip', this.datum === 'nose'],
+    ]);
+    const sheetRow = element('div', 'export-row', this.box);
+    this.action(sheetRow, 'sheet-svg', 'Save SVG', function saveSheet() {
+      self.saveSheet();
+    });
+    this.action(sheetRow, 'sheet-print', 'Print', function printSheet() {
+      self.printSheet();
+    });
+
+    this.heading('Pictures and model');
+    const pictureRow = element('div', 'export-row', this.box);
+    this.action(pictureRow, 'view-png', 'View as PNG', function savePicture() {
+      self.savePicture();
+    });
+    const transparent = element('button', 'toggle', pictureRow);
+    transparent.textContent = 'Transparent';
+    transparent.title = 'No background behind the rocket';
+    transparent.dataset.option = 'transparent';
+    transparent.classList.toggle('active', this.transparent);
+    transparent.addEventListener('click', function toggle() {
+      self.transparent = !self.transparent;
+      self.build();
+    });
+    const modelRow = element('div', 'export-row', this.box);
+    this.action(modelRow, 'page-svg', 'Page as SVG', function savePage() {
+      self.savePage();
+    });
+    this.action(modelRow, 'model-glb', 'Model (.glb)', function saveModel() {
+      self.saveModel();
+    });
   }
 
-  private choice(key: 'files' | 'overlaps', values: Array<[string, string]>): void {
+  private heading(text: string): void {
+    const title = element('div', 'adjust-title', this.box);
+    title.textContent = text;
+  }
+
+  private action(parent: HTMLElement, name: string, label: string, run: () => void): void {
+    const button = element('button', 'secondary', parent);
+    button.textContent = label;
+    button.dataset.action = name;
+    button.addEventListener('click', run);
+  }
+
+  // A row of choices: "key:value", label, chosen.
+  private choice(values: Array<[string, string, boolean]>): void {
     const self = this;
     const group = element('div', 'segmented', this.box);
     for (let i = 0; i < values.length; i++) {
-      const value = values[i][0];
+      const option = values[i][0];
       const button = element('button', '', group);
       button.textContent = values[i][1];
-      button.dataset.option = key + ':' + value;
-      button.classList.toggle('active', this.options[key] === value);
+      button.dataset.option = option;
+      button.classList.toggle('active', values[i][2]);
       button.addEventListener('click', function set() {
-        if (key === 'files') {
-          self.options.files = value as CutOptions['files'];
-        } else {
-          self.options.overlaps = value as CutOptions['overlaps'];
-        }
+        self.set(option);
         self.build();
       });
+    }
+  }
+
+  private set(option: string): void {
+    const parts = option.split(':');
+    const key = parts[0];
+    const value = parts[1];
+    if (key === 'files') {
+      this.options.files = value as CutOptions['files'];
+    } else if (key === 'overlaps') {
+      this.options.overlaps = value as CutOptions['overlaps'];
+    } else if (key === 'paper') {
+      this.paper = value as Paper;
+    } else if (key === 'datum') {
+      this.datum = value as Datum;
     }
   }
 
@@ -490,6 +583,7 @@ export class ExportDialog {
     const pieces = cutPieces(this.editor);
     this.close();
     if (pieces.length === 0) {
+      this.editor.report('There are no decals to cut.');
       return;
     }
     const files = cutFiles(pieces, this.options);
@@ -497,8 +591,72 @@ export class ExportDialog {
       const file = files[i];
       // A little apart: browsers drop downloads started in the same instant.
       setTimeout(function save() {
-        download(file.fileName, file.text);
+        downloadText(file.fileName, file.text, 'image/svg+xml');
       }, i * 250);
     }
+  }
+
+  private saveSheet(): void {
+    const sheet = placementSheet(this.editor, this.pagePane, this.paper, this.datum);
+    this.close();
+    if (sheet === null) {
+      this.editor.report('The flat page is not built yet.');
+      return;
+    }
+    downloadText('dc6-placement-' + this.paper + '.svg', sheet.svg, 'image/svg+xml');
+  }
+
+  private printSheet(): void {
+    const sheet = placementSheet(this.editor, this.pagePane, this.paper, this.datum);
+    this.close();
+    if (sheet === null) {
+      this.editor.report('The flat page is not built yet.');
+      return;
+    }
+    const html = printablePage(sheet, this.paper);
+    const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+    const opened = window.open(url, '_blank');
+    if (opened === null) {
+      this.editor.report('The browser blocked the print window; save the SVG and print that.');
+    }
+    setTimeout(function release() {
+      URL.revokeObjectURL(url);
+    }, 60000);
+  }
+
+  private savePicture(): void {
+    this.close();
+    const editor = this.editor;
+    editor.viewPicture(2, this.transparent).then(
+      function made(blob) {
+        downloadBlob('dc6-view.png', blob);
+      },
+      function failed(error: unknown) {
+        editor.report(error instanceof Error ? error.message : String(error));
+      },
+    );
+  }
+
+  private savePage(): void {
+    const svg = pageSvg(this.editor, this.pagePane);
+    this.close();
+    if (svg === null) {
+      this.editor.report('The flat page is not built yet.');
+      return;
+    }
+    downloadText('dc6-page.svg', svg, 'image/svg+xml');
+  }
+
+  private saveModel(): void {
+    this.close();
+    const editor = this.editor;
+    modelGlb(editor).then(
+      function made(blob) {
+        downloadBlob('dc6-rocket.glb', blob);
+      },
+      function failed(error: unknown) {
+        editor.report('Model: ' + (error instanceof Error ? error.message : String(error)));
+      },
+    );
   }
 }

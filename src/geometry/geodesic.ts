@@ -490,3 +490,43 @@ export function nearestOnPiece(surface: Surface, pieceNumber: number, world: Vec
   }
   return best;
 }
+
+// The surface point nearest to a world point, over the given pieces (all
+// when null), within `radius`, whose outward normal agrees with `normal`
+// (dot product at least 0.5) unless that is null. Used to find where a
+// symmetry copy of a decal lands, and where a decal goes when its part is
+// replaced by a revised file. Returns the point and its distance.
+export function nearestOnSurface(surface: Surface, world: Vec3, normal: Vec3 | null, radius: number, pieces: number[] | null): { at: SurfacePoint; distance: number } | null {
+  let best: { at: SurfacePoint; distance: number } | null = null;
+  for (let p = 0; p < surface.pieces.length; p++) {
+    if (pieces !== null && pieces.indexOf(p) < 0) {
+      continue;
+    }
+    const piece = surface.pieces[p];
+    const local = applyToPoint(piece.inverse, world);
+    let localNormal: Vec3 | null = null;
+    if (normal !== null) {
+      localNormal = applyToDirection(piece.inverse, normal);
+    }
+    const candidates = trianglesNear(piece.bvh, local, radius);
+    for (let k = 0; k < candidates.length; k++) {
+      const t = candidates[k];
+      const n = triangleNormal(piece.mesh, t);
+      if (n[0] === 0 && n[1] === 0 && n[2] === 0) {
+        continue;
+      }
+      if (localNormal !== null && dot(n, localNormal) < 0.5) {
+        continue;
+      }
+      const closest = closestPointOnTriangle(local, meshVertex(piece.mesh, t, 0), meshVertex(piece.mesh, t, 1), meshVertex(piece.mesh, t, 2));
+      const gap = length(sub(closest, local));
+      if (gap > radius) {
+        continue;
+      }
+      if (best === null || gap < best.distance) {
+        best = { at: { piece: p, triangle: t, point: closest }, distance: gap };
+      }
+    }
+  }
+  return best;
+}

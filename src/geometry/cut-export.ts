@@ -32,6 +32,17 @@ export interface CutPiece {
   flipY: boolean;
   // Artwork colour -> vinyl colour; colours not listed are cut as they are.
   colourMap: Record<string, string>;
+  // How many of this piece to cut (linked copies of one decal are one
+  // outline, cut that many times). The label says so when more than one.
+  quantity: number;
+}
+
+// The label under a piece: its name, and the quantity when more than one.
+export function pieceLabel(piece: CutPiece): string {
+  if (piece.quantity > 1) {
+    return piece.name + ' ×' + String(piece.quantity);
+  }
+  return piece.name;
 }
 
 export interface CutOptions {
@@ -287,7 +298,7 @@ function labelGroup(placed: Placed[], inkscape: boolean): string {
     const entry = placed[i];
     const x = formatNumber(entry.x);
     const y = formatNumber(entry.y + entry.piece.height + labelGap + labelSize * 0.8);
-    lines.push('    <text x="' + x + '" y="' + y + '" font-family="sans-serif" font-size="' + String(labelSize) + '" fill="#000000">' + escapeXml(entry.piece.name) + '</text>');
+    lines.push('    <text x="' + x + '" y="' + y + '" font-family="sans-serif" font-size="' + String(labelSize) + '" fill="#000000">' + escapeXml(pieceLabel(entry.piece)) + '</text>');
   }
   lines.push('  </g>');
   return lines.join('\n') + '\n';

@@ -45,6 +45,7 @@ export interface TestHook {
   decalInfo(id: string): DecalInfo | null;
   decalHandles(): Array<{ handle: string; x: number; y: number }>;
   decalMapTimes(): number[];
+  decalDragTimes(): number[];
   // The mapped grid of a decal: rows of world points (null where absent).
   decalGrid(id: string): { columns: number; rows: number; xs: number[]; ys: number[]; points: Array<Vec3 | null> } | null;
   // The flat page.
@@ -67,6 +68,22 @@ export interface TestHook {
   hoverPoint3d(): boolean;
   viewRoll(): number;
   pageDrawTimes(): number[];
+  // Resolves once no page build is waiting or running.
+  pageSettled(): Promise<void>;
+  // Resolves once the last project file opened is in.
+  opened(): Promise<void>;
+  // How many autosaves were written; write one now.
+  autosaves(): number;
+  flushAutosave(): Promise<void>;
+  // Decals: linked copies of one.
+  decalGroup(id: string): string[];
+}
+
+// The app's side of the project file and autosave, for the hook.
+export interface ProjectHooks {
+  opening(): Promise<void>;
+  autosaves(): number;
+  flushAutosave(): Promise<void>;
 }
 
 export interface PageInfo {
@@ -90,7 +107,7 @@ export interface DecalInfo {
   corners: Array<Vec3 | null>;
 }
 
-export function installTestHook(editor: Editor, importer: Importer, bundled: Promise<void>, pagePane: PagePane): void {
+export function installTestHook(editor: Editor, importer: Importer, bundled: Promise<void>, pagePane: PagePane, project: ProjectHooks): void {
   const hook: TestHook = {
     loaded: async function loaded(): Promise<void> {
       await bundled;
@@ -180,6 +197,9 @@ export function installTestHook(editor: Editor, importer: Importer, bundled: Pro
     decalMapTimes: function decalMapTimes(): number[] {
       return editor.decals.mapTimes.slice();
     },
+    decalDragTimes: function decalDragTimes(): number[] {
+      return editor.decals.dragStepTimes.slice();
+    },
     decalGrid: function decalGrid(id: string) {
       const grid = editor.decals.gridOf(id);
       if (grid === null) {
@@ -257,6 +277,39 @@ export function installTestHook(editor: Editor, importer: Importer, bundled: Pro
     },
     pageDrawTimes: function pageDrawTimes(): number[] {
       return pagePane.drawTimes.slice();
+    },
+    pageSettled: async function pageSettled(): Promise<void> {
+      while (pagePane.isBuilding()) {
+        await new Promise(function wait(resolve) {
+          setTimeout(resolve, 50);
+        });
+      }
+    },
+    opened: function opened(): Promise<void> {
+      return project.opening();
+    },
+    autosaves: function autosaves(): number {
+      return project.autosaves();
+    },
+    flushAutosave: function flushAutosave(): Promise<void> {
+      return project.flushAutosave();
+    },
+    decalGroup: function group(id: string): string[] {
+      const doc = editor.document;
+      const ids: string[] = [];
+      const decal = doc.decals.find(function byId(d) {
+        return d.id === id;
+      });
+      if (decal === undefined) {
+        return ids;
+      }
+      for (let i = 0; i < doc.decals.length; i++) {
+        const other = doc.decals[i];
+        if (other.id === id || (decal.symmetry !== null && other.symmetry !== null && other.symmetry.group === decal.symmetry.group)) {
+          ids.push(other.id);
+        }
+      }
+      return ids;
     },
   };
   (window as unknown as { dc6: TestHook }).dc6 = hook;

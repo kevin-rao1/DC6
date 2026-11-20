@@ -39,7 +39,7 @@ function partCentre(part: Part): Vec3 {
 export function infoOf(list: Placed[], symmetry: Array<number | null>): PieceInfo[] {
   const info: PieceInfo[] = [];
   for (let i = 0; i < list.length; i++) {
-    info.push({ name: list[i].part.name, faces: list[i].part.faces, triangleFace: list[i].part.triangleFace, symmetryNumber: symmetry[i] });
+    info.push({ name: list[i].part.name, faces: list[i].part.faces, triangleFace: list[i].part.triangleFace, symmetryNumber: symmetry[i], onBody: true });
   }
   return info;
 }

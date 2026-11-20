@@ -14,6 +14,13 @@ export class History {
     this.current = cloneDocument(initial);
   }
 
+  // Start again from this document, with nothing to undo (a project opened).
+  reset(initial: AssemblyDocument): void {
+    this.past = [];
+    this.future = [];
+    this.current = cloneDocument(initial);
+  }
+
   get document(): AssemblyDocument {
     return this.current;
   }

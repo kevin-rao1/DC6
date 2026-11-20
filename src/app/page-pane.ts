@@ -21,12 +21,13 @@ import { applyToPoint } from '../geometry/transform.ts';
 import { barycentricOf, pointFromBarycentric } from '../geometry/surface-mesh.ts';
 import type { DecalFrame, DecalGrid } from '../geometry/decal-map.ts';
 import type { DecalPageTriangle, Page, PageView } from '../geometry/page.ts';
-import { buildPage, decalPageTriangles, decalPointAt, decalToPage, pageToSurface, surfaceToPage, viewPage } from '../geometry/page.ts';
-import type { PieceInfo } from '../geometry/page-islands.ts';
+import { decalPageTriangles, islandGap, decalPointAt, decalToPage, pageToSurface, surfaceToPage, viewPage } from '../geometry/page.ts';
 import { radiusOf } from '../geometry/page-strip.ts';
 import type { Artwork } from '../geometry/artwork.ts';
 import type { AssemblyDocument } from '../model/document.ts';
-import { findPlaced } from '../model/document.ts';
+import { findPlaced, subtreeIds } from '../model/document.ts';
+import type { PageWorkerPart, PageWorkerPiece } from './page-protocol.ts';
+import { PageBuilder } from './page-builder.ts';
 import { findDecal } from '../model/decals.ts';
 import type { Decal } from '../model/decals.ts';
 import type { Editor } from './editor.ts';
@@ -45,7 +46,8 @@ const handleReach = 9;
 const rotateHandleOffset = 26;
 
 const partGrey = '#9b9ba0';
-// Wait this long (ms) after the assembly changes before building the page again.
+// Wait this long (ms) after the assembly changes before building the page
+// again (in the page worker).
 const rebuildDelay = 250;
 
 interface PressState {
@@ -93,7 +95,13 @@ export class PagePane {
   page: Page | null = null;
   view: PageView | null = null;
   private pageKey = '';
+  // The key of the page being built in the worker, or ''.
+  private buildingKey = '';
   private buildQueued = false;
+  private readonly builder = new PageBuilder();
+  // The worker's key for each part mesh sent to it.
+  private readonly workerKeys = new WeakMap<object, number>();
+  private nextWorkerKey = 1;
   // Page millimetre at the canvas's top left corner, and CSS px per mm.
   originX = 0;
   originY = 0;
@@ -209,6 +217,9 @@ export class PagePane {
       changed: function changed() {
         self.documentChanged();
       },
+      previewed: function previewed() {
+        self.queueDraw();
+      },
     });
     editor.onHoverPoint(function hoverIn3d() {
       self.queueDraw();
@@ -225,20 +236,24 @@ export class PagePane {
   // ---------------------------------------------------------------------------
   // Building the page from the assembly.
 
-  private documentChanged(): void {
-    const doc = this.editor.document;
+  // What the page is built from: the visible parts and where they are.
+  private keyOf(doc: AssemblyDocument): string {
     const keyParts: unknown[] = [];
     for (let i = 0; i < doc.placed.length; i++) {
       const placed = doc.placed[i];
       if (!placed.hidden) {
-        keyParts.push(placed.id, placed.partId, placed.transform);
+        keyParts.push(placed.id, placed.partId, placed.transform, placed.parentId);
       }
     }
-    const key = JSON.stringify(keyParts);
-    if (key !== this.pageKey && !this.buildQueued) {
-      // Building takes most of a second (ray casts, on this thread), so it
-      // waits a moment: a quick run of edits builds once. (Doubt: it still
-      // holds the window up while it runs; the import worker could do it.)
+    return JSON.stringify(keyParts);
+  }
+
+  private documentChanged(): void {
+    const key = this.keyOf(this.editor.document);
+    if (key !== this.pageKey && this.buildingKey === '' && !this.buildQueued) {
+      // A quick run of edits builds once. The build runs in a worker; the
+      // old page stays up until the new one arrives, and one build at a
+      // time runs (when it lands, the assembly is looked at again).
       this.buildQueued = true;
       const self = this;
       window.setTimeout(function build() {
@@ -249,26 +264,51 @@ export class PagePane {
     this.queueDraw();
   }
 
+  // A project is being opened: drop the page and any build on its way.
+  reset(): void {
+    this.page = null;
+    this.view = null;
+    this.pageKey = '';
+    this.buildingKey = '';
+    this.drawings.clear();
+    this.heldDrawing = null;
+    this.userMoved = false;
+    this.queueDraw();
+  }
+
+  // Is a new page on its way (for the test hook)?
+  isBuilding(): boolean {
+    return this.buildQueued || this.buildingKey !== '';
+  }
+
   private rebuild(): void {
     const doc = this.editor.document;
-    const keyParts: unknown[] = [];
-    for (let i = 0; i < doc.placed.length; i++) {
-      const placed = doc.placed[i];
-      if (!placed.hidden) {
-        keyParts.push(placed.id, placed.partId, placed.transform);
-      }
+    const key = this.keyOf(doc);
+    if (key === this.pageKey || this.buildingKey !== '') {
+      return;
     }
-    this.pageKey = JSON.stringify(keyParts);
     const surface = this.editor.decals.surfaceFor(doc);
     if (surface.pieces.length === 0) {
+      this.pageKey = key;
+      this.buildingKey = '';
       this.page = null;
       this.view = null;
       this.queueDraw();
       return;
     }
-    const info: PieceInfo[] = [];
+    // The parts on the body: the root and everything hung on it.
+    const onBody = new Set<string>();
+    if (doc.rootId !== null && findPlaced(doc, doc.rootId) !== null) {
+      const ids = subtreeIds(doc, doc.rootId);
+      for (let i = 0; i < ids.length; i++) {
+        onBody.add(ids[i]);
+      }
+    }
+    const parts: PageWorkerPart[] = [];
+    const pieces: PageWorkerPiece[] = [];
     for (let i = 0; i < surface.pieces.length; i++) {
-      const placed = findPlaced(doc, surface.pieces[i].placedId);
+      const piece = surface.pieces[i];
+      const placed = findPlaced(doc, piece.placedId);
       if (placed === null) {
         throw new Error('PagePane: a surface piece without a placed part');
       }
@@ -276,17 +316,42 @@ export class PagePane {
       if (part === undefined) {
         throw new Error('PagePane: no loaded part ' + placed.partId);
       }
+      let partKey = this.workerKeys.get(piece.mesh);
+      if (partKey === undefined) {
+        partKey = this.nextWorkerKey;
+        this.nextWorkerKey = this.nextWorkerKey + 1;
+        this.workerKeys.set(piece.mesh, partKey);
+        parts.push({ key: partKey, name: part.name, mesh: piece.mesh, bvh: piece.bvh, positions: piece.partPositions, indices: piece.partIndices, faces: part.faces, triangleFace: part.triangleFace });
+      }
       let symmetryNumber: number | null = null;
       if (placed.symmetry !== null) {
         symmetryNumber = placed.symmetry.index + 1;
       }
-      info.push({ name: part.name, faces: part.faces, triangleFace: part.triangleFace, symmetryNumber: symmetryNumber });
+      pieces.push({ placedId: piece.placedId, key: partKey, transform: piece.transform, symmetryNumber: symmetryNumber, onBody: onBody.has(placed.id) });
     }
-    this.page = buildPage(surface, info);
-    this.makeView();
-    if (!this.userMoved) {
-      this.fit();
-    }
+    this.buildingKey = key;
+    const self = this;
+    this.builder.build(parts, pieces).then(
+      function arrived(page: Page | null) {
+        if (page === null || self.buildingKey !== key) {
+          return; // the page was reset (a project opened) meanwhile
+        }
+        self.buildingKey = '';
+        self.pageKey = key;
+        page.surface = surface;
+        self.page = page;
+        self.makeView();
+        if (!self.userMoved) {
+          self.fit();
+        }
+        // The assembly may have changed while this one was built.
+        self.documentChanged();
+      },
+      function failed(error: unknown) {
+        self.buildingKey = '';
+        console.error('page build failed', error);
+      },
+    );
   }
 
   private makeView(): void {
@@ -305,27 +370,33 @@ export class PagePane {
       return;
     }
     const page = view.page;
-    const strip = new Map<string, { placedId: string; band: number; path: Path2D }>();
+    // Paths are made from path data text: adding thousands of closed
+    // polygons to a Path2D one by one takes most of a second in Chromium.
+    const strip = new Map<string, { placedId: string; band: number; data: string[] }>();
     for (let f = 0; f < view.stripFaceCount; f++) {
       const face = view.faces[f];
       const placedId = page.placedIds[face.piece];
       const key = placedId + '|' + String(face.chart);
       let entry = strip.get(key);
       if (entry === undefined) {
-        entry = { placedId: placedId, band: face.chart, path: new Path2D() };
+        entry = { placedId: placedId, band: face.chart, data: [] };
         strip.set(key, entry);
       }
-      addPolygon(entry.path, face.polygon);
+      entry.data.push(polygonData(face.polygon));
     }
     // The strip itself last, so it is drawn over the faded repeats.
-    this.stripPaths = Array.from(strip.values());
+    const stripPaths: Array<{ placedId: string; band: number; path: Path2D }> = [];
+    strip.forEach(function made(entry) {
+      stripPaths.push({ placedId: entry.placedId, band: entry.band, path: new Path2D(entry.data.join('')) });
+    });
+    this.stripPaths = stripPaths;
     this.stripPaths.sort(function repeatsFirst(a, b) {
       return Math.abs(b.band) - Math.abs(a.band);
     });
     this.islandPaths = [];
     for (let i = 0; i < page.islands.length; i++) {
       const island = page.islands[i];
-      const path = new Path2D();
+      const data: string[] = [];
       for (let k = 0; k < island.triangles.length; k++) {
         const c = island.corners;
         const polygon = [c[6 * k], c[6 * k + 1], c[6 * k + 2], c[6 * k + 3], c[6 * k + 4], c[6 * k + 5]];
@@ -336,12 +407,12 @@ export class PagePane {
         // Counterclockwise, so the triangles fill as one shape without seams.
         const area = (polygon[2] - polygon[0]) * (polygon[5] - polygon[1]) - (polygon[4] - polygon[0]) * (polygon[3] - polygon[1]);
         if (area < 0) {
-          addPolygon(path, [polygon[0], polygon[1], polygon[4], polygon[5], polygon[2], polygon[3]]);
+          data.push(polygonData([polygon[0], polygon[1], polygon[4], polygon[5], polygon[2], polygon[3]]));
         } else {
-          addPolygon(path, polygon);
+          data.push(polygonData(polygon));
         }
       }
-      this.islandPaths.push({ placedId: page.placedIds[island.piece], path: path });
+      this.islandPaths.push({ placedId: page.placedIds[island.piece], path: new Path2D(data.join('')) });
     }
     this.outlinePath = segmentsPath(view.outline);
     for (let i = 0; i < page.islands.length; i++) {
@@ -467,6 +538,9 @@ export class PagePane {
       return null;
     }
     const mesh = surface.pieces[piece].mesh;
+    if (view.page.surface.pieces[found.piece].mesh !== mesh) {
+      return null; // the part was replaced; the new page is on its way
+    }
     const local = pointFromBarycentric(mesh, found.triangle, found.barycentric);
     const world = applyToPoint(surface.pieces[piece].transform, local);
     return { at: { piece: piece, triangle: found.triangle, point: local }, world: world, chart: found.chart };
@@ -880,7 +954,7 @@ export class PagePane {
   // A decal's drawing: its page triangles, and a bitmap of it at about the
   // screen's resolution, made again only when the decal, the roll or the
   // zoom (by a good step) changes.
-  private drawingOf(grid: DecalGrid, decal: Pick<Decal, 'artworkId' | 'colourMap' | 'width' | 'height' | 'flipX' | 'flipY'>, cached: DecalDrawing | null): DecalDrawing | null {
+  private drawingOf(grid: DecalGrid, decal: Pick<Decal, 'artworkId' | 'colourMap' | 'width' | 'height' | 'flipX' | 'flipY'>, cached: DecalDrawing | null, moving: boolean): DecalDrawing | null {
     const view = this.view;
     if (view === null) {
       return null;
@@ -889,7 +963,12 @@ export class PagePane {
     if (artwork === undefined) {
       return null;
     }
-    const wanted = Math.min(24, Math.max(1, Math.pow(2, Math.ceil(Math.log2(this.zoom * window.devicePixelRatio)))));
+    let wanted = Math.min(24, Math.max(1, Math.pow(2, Math.ceil(Math.log2(this.zoom * window.devicePixelRatio)))));
+    if (moving) {
+      // While a decal is dragged its bitmap is made again every step:
+      // coarser then, sharp again once it is let go.
+      wanted = Math.min(wanted, 2);
+    }
     const key = JSON.stringify([decal.artworkId, decal.colourMap, decal.width, decal.height, decal.flipX, decal.flipY]);
     let drawing = cached;
     if (drawing === null || drawing.grid !== grid || drawing.roll !== view.roll || drawing.key !== key) {
@@ -940,8 +1019,9 @@ export class PagePane {
       return;
     }
     const texture = this.texture(artwork, decal.colourMap, Math.max(decal.width, decal.height));
-    for (let t = 0; t < drawing.triangles.length; t++) {
-      const triangle = drawing.triangles[t];
+    const triangles = rasterTriangles(drawing, scale);
+    for (let t = 0; t < triangles.length; t++) {
+      const triangle = triangles[t];
       const destination: number[] = [];
       const source: number[] = [];
       for (let q = 0; q < 3; q++) {
@@ -968,6 +1048,7 @@ export class PagePane {
     const ratio = window.devicePixelRatio;
     const decals = this.editor.decals;
     const present = new Set<string>();
+    const moving = decals.movingIds();
     for (let layer = 0; layer < doc.decals.length; layer++) {
       const decal = doc.decals[layer];
       if (decal.hidden) {
@@ -978,7 +1059,7 @@ export class PagePane {
         continue;
       }
       const cached = this.drawings.get(decal.id);
-      const drawing = this.drawingOf(grid, decal, cached === undefined ? null : cached);
+      const drawing = this.drawingOf(grid, decal, cached === undefined ? null : cached, moving.has(decal.id));
       if (drawing === null) {
         continue;
       }
@@ -998,7 +1079,7 @@ export class PagePane {
     if (heldGrid !== null && heldArtwork !== null) {
       const settings = decals.heldSettingsNow();
       if (settings !== null) {
-        this.heldDrawing = this.drawingOf(heldGrid, settings, this.heldDrawing);
+        this.heldDrawing = this.drawingOf(heldGrid, settings, this.heldDrawing, true);
         if (this.heldDrawing !== null) {
           this.blit(context, this.heldDrawing, ratio, 0.85);
         }
@@ -1029,17 +1110,30 @@ export class PagePane {
       return;
     }
     const context = this.context;
-    // Beside the island, to its right: islands are stacked one above the
-    // other, so there is room there at any zoom.
-    context.font = '11px "DM Sans", system-ui, sans-serif';
+    // Centred on the island, on its side away from the strip. Islands in a
+    // row are an even gap apart, so a label gets its island's width and
+    // the gap; a longer one is set smaller, then shortened.
     context.fillStyle = '#85858c';
-    context.textBaseline = 'middle';
+    context.textAlign = 'center';
     for (let i = 0; i < page.islands.length; i++) {
       const island = page.islands[i];
-      const x = (island.maxX + island.offsetX - this.originX) * this.zoom + 6;
-      const y = (this.originY - (island.minY + island.maxY) / 2 - island.offsetY) * this.zoom;
-      context.fillText(island.label, x, y);
+      const room = (island.maxX - island.minX + islandGap) * this.zoom - 6;
+      const fitted = fitLabel(context, island.label, room);
+      if (fitted === null) {
+        continue;
+      }
+      const x = ((island.minX + island.maxX) / 2 + island.offsetX - this.originX) * this.zoom;
+      let y = 0;
+      if (island.labelSide > 0) {
+        context.textBaseline = 'bottom';
+        y = (this.originY - island.maxY - island.offsetY) * this.zoom - 4;
+      } else {
+        context.textBaseline = 'top';
+        y = (this.originY - island.minY - island.offsetY) * this.zoom + 4;
+      }
+      context.fillText(fitted, x, y);
     }
+    context.textAlign = 'left';
   }
 
   // The selected decal: its outline and handles, on every drawing of it.
@@ -1306,21 +1400,153 @@ export class PagePane {
   }
 }
 
-function addPolygon(path: Path2D, polygon: number[]): void {
-  path.moveTo(polygon[0], polygon[1]);
-  for (let q = 2; q < polygon.length; q = q + 2) {
-    path.lineTo(polygon[q], polygon[q + 1]);
+// A label that fits in `room` CSS px: at 11 px, else 10 or 9 px, else
+// shortened with an ellipsis. Sets the context's font. Null if nothing fits.
+function fitLabel(context: CanvasRenderingContext2D, text: string, room: number): string | null {
+  const sizes = [11, 10, 9];
+  for (let i = 0; i < sizes.length; i++) {
+    context.font = String(sizes[i]) + 'px "DM Sans", system-ui, sans-serif';
+    if (context.measureText(text).width <= room) {
+      return text;
+    }
   }
-  path.closePath();
+  let shorter = text;
+  while (shorter.length > 1) {
+    shorter = shorter.slice(0, shorter.length - 1);
+    if (context.measureText(shorter + '…').width <= room) {
+      return shorter + '…';
+    }
+  }
+  return null;
+}
+
+// The triangles a decal's bitmap is drawn from. Each grid triangle costs a
+// clip and a draw, which is most of a second for a few big decals; where
+// the bitmap is coarse, blocks of whole grid cells are drawn as two
+// triangles instead, so a block is about 6 bitmap pixels across. Inside a
+// block the page map is not quite affine (it bends at the mesh's facet
+// lines), but by well under a pixel at that resolution. A block with a
+// missing cell (a hole, an edge, the seam) is drawn cell by cell.
+function rasterTriangles(drawing: DecalDrawing, pixelsPerMillimetre: number): DecalPageTriangle[] {
+  const grid = drawing.grid;
+  let cell = Infinity;
+  for (let i = 0; i + 1 < grid.xs.length; i++) {
+    cell = Math.min(cell, grid.xs[i + 1] - grid.xs[i]);
+  }
+  for (let j = 0; j + 1 < grid.ys.length; j++) {
+    cell = Math.min(cell, grid.ys[j + 1] - grid.ys[j]);
+  }
+  const step = Math.min(8, Math.floor(6 / Math.max(1e-9, cell * pixelsPerMillimetre)));
+  if (!Number.isFinite(cell) || step <= 1) {
+    return drawing.triangles;
+  }
+  const columnOf = new Map<number, number>();
+  for (let i = 0; i < grid.xs.length; i++) {
+    columnOf.set(grid.xs[i], i);
+  }
+  const rowOf = new Map<number, number>();
+  for (let j = 0; j < grid.ys.length; j++) {
+    rowOf.set(grid.ys[j], j);
+  }
+  // Per drawing (copy): the page point of each grid point, and the
+  // triangles of each cell.
+  const corners = new Map<string, [number, number]>();
+  const cells = new Map<string, DecalPageTriangle[]>();
+  const copies: number[] = [];
+  for (let t = 0; t < drawing.triangles.length; t++) {
+    const triangle = drawing.triangles[t];
+    let lowI = Infinity;
+    let lowJ = Infinity;
+    for (let q = 0; q < 3; q++) {
+      const i = columnOf.get(triangle.decal[2 * q]);
+      const j = rowOf.get(triangle.decal[2 * q + 1]);
+      if (i === undefined || j === undefined) {
+        return drawing.triangles; // not on the grid lines: draw as it is
+      }
+      corners.set(String(triangle.copy) + ':' + String(i) + ':' + String(j), [triangle.page[2 * q], triangle.page[2 * q + 1]]);
+      lowI = Math.min(lowI, i);
+      lowJ = Math.min(lowJ, j);
+    }
+    const key = String(triangle.copy) + ':' + String(lowI) + ':' + String(lowJ);
+    let list = cells.get(key);
+    if (list === undefined) {
+      list = [];
+      cells.set(key, list);
+    }
+    list.push(triangle);
+    if (copies.indexOf(triangle.copy) < 0) {
+      copies.push(triangle.copy);
+    }
+  }
+  const result: DecalPageTriangle[] = [];
+  for (let c = 0; c < copies.length; c++) {
+    const copy = String(copies[c]);
+    for (let bj = 0; bj + 1 < grid.rows; bj = bj + step) {
+      const tj = Math.min(grid.rows - 1, bj + step);
+      for (let bi = 0; bi + 1 < grid.columns; bi = bi + step) {
+        const ti = Math.min(grid.columns - 1, bi + step);
+        let whole = true;
+        let any = false;
+        for (let j = bj; j < tj && whole; j++) {
+          for (let i = bi; i < ti; i++) {
+            const list = cells.get(copy + ':' + String(i) + ':' + String(j));
+            if (list === undefined || list.length !== 2) {
+              whole = false;
+            }
+            if (list !== undefined) {
+              any = true;
+            }
+          }
+        }
+        const a = corners.get(copy + ':' + String(bi) + ':' + String(bj));
+        const b = corners.get(copy + ':' + String(ti) + ':' + String(bj));
+        const d = corners.get(copy + ':' + String(ti) + ':' + String(tj));
+        const e = corners.get(copy + ':' + String(bi) + ':' + String(tj));
+        if (whole && a !== undefined && b !== undefined && d !== undefined && e !== undefined) {
+          const x0 = grid.xs[bi];
+          const x1 = grid.xs[ti];
+          const y0 = grid.ys[bj];
+          const y1 = grid.ys[tj];
+          result.push({ page: [a[0], a[1], b[0], b[1], d[0], d[1]], decal: [x0, y0, x1, y0, x1, y1], copy: copies[c] });
+          result.push({ page: [a[0], a[1], d[0], d[1], e[0], e[1]], decal: [x0, y0, x1, y1, x0, y1], copy: copies[c] });
+          continue;
+        }
+        if (!any) {
+          continue;
+        }
+        for (let j = bj; j < tj; j++) {
+          for (let i = bi; i < ti; i++) {
+            const list = cells.get(copy + ':' + String(i) + ':' + String(j));
+            if (list === undefined) {
+              continue;
+            }
+            for (let k = 0; k < list.length; k++) {
+              result.push(list[k]);
+            }
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+// A closed polygon as path data text.
+function polygonData(polygon: number[]): string {
+  const parts: string[] = ['M' + String(polygon[0]) + ' ' + String(polygon[1])];
+  for (let q = 2; q < polygon.length; q = q + 2) {
+    parts.push('L' + String(polygon[q]) + ' ' + String(polygon[q + 1]));
+  }
+  parts.push('Z');
+  return parts.join('');
 }
 
 function segmentsPath(segments: number[]): Path2D {
-  const path = new Path2D();
+  const parts: string[] = [];
   for (let i = 0; i < segments.length; i = i + 4) {
-    path.moveTo(segments[i], segments[i + 1]);
-    path.lineTo(segments[i + 2], segments[i + 3]);
+    parts.push('M' + String(segments[i]) + ' ' + String(segments[i + 1]) + 'L' + String(segments[i + 2]) + ' ' + String(segments[i + 3]));
   }
-  return path;
+  return new Path2D(parts.join(''));
 }
 
 function colourOf(doc: AssemblyDocument, placedId: string): string {

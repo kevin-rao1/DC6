@@ -50,6 +50,11 @@ export class PartGizmo {
   private free = false;
   private lastMotion: RigidTransform | null = null;
 
+  // What the gizmo adds to the scene (hidden for a picture of the view).
+  sceneObjects(): THREE.Object3D[] {
+    return [this.proxy, this.controls.getHelper()];
+  }
+
   constructor(view: View, labelParent: HTMLElement, events: GizmoEvents) {
     this.view = view;
     this.events = events;

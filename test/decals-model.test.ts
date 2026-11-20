@@ -18,6 +18,7 @@ function decalOn(placedId: string, name: string): NewDecal {
     hidden: false,
     locked: false,
     colourMap: {},
+    symmetry: null,
   };
 }
 

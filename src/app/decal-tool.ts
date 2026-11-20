@@ -32,7 +32,9 @@ import { AFT_DIRECTION } from '../geometry/rocket-axis.ts';
 import type { AssemblyDocument } from '../model/document.ts';
 import { findPlaced } from '../model/document.ts';
 import type { Decal, NewDecal } from '../model/decals.ts';
-import { addDecal, duplicateDecal, findDecal, moveDecalLayer, removeDecal, requireDecal, setDecalColour, setPartColour, updateDecal } from '../model/decals.ts';
+import { addDecal, decalGroup, duplicateDecal, findDecal, removeDecalGroup, reorderDecals, requireDecal, setDecalColour, setPartColour, updateDecal } from '../model/decals.ts';
+import { decalSymmetryChoices, makeDecalUnique, setDecalSymmetry, syncDecalGroup } from '../model/decal-symmetry.ts';
+import { symmetryMembers } from '../model/document.ts';
 import type { Editor, LastOperation } from './editor.ts';
 import { DecalHandles, DecalVisual, lifted, rasterise, textureSize } from './decal-visuals.ts';
 import { pickPart, worldFace } from './picking.ts';
@@ -113,6 +115,8 @@ export class DecalTool {
   private readonly editor: Editor;
   readonly artworks = new Map<string, Artwork>();
   readonly artworkOrder: string[] = [];
+  // The SVG text each artwork was read from (the project file keeps it).
+  readonly artworkSources = new Map<string, { fileName: string; text: string }>();
   private nextArtwork = 1;
   selectedId: string | null = null;
 
@@ -126,14 +130,17 @@ export class DecalTool {
   private readonly handles = new DecalHandles();
   // The latest grid of each decal drawn (by id), for picking and handles.
   private readonly grids = new Map<string, DecalGrid>();
-  private readonly meshes = new Map<string, SurfaceMesh>();
+  // By part object, not id: a project opened later may reuse an id.
+  private readonly meshes = new WeakMap<Part, SurfaceMesh>();
   private surfaceKey = '';
   private surface: Surface = { pieces: [] };
   // Screen-space handles of the selected decal: where they are in the world.
   private handlePoints: Array<{ handle: Handle; point: Vec3; normal: Vec3 }> = [];
   private readonly label: HTMLDivElement;
-  // Milliseconds per decal re-map while dragging (for the e2e report).
+  // Milliseconds per decal re-map while dragging, and per whole drag step
+  // (finding the place, re-mapping, drawing the 3D scene), for the e2e report.
   readonly mapTimes: number[] = [];
+  readonly dragStepTimes: number[] = [];
   private shift = false;
   // The 3D view as a pointer source.
   readonly view3d: DecalPointer;
@@ -194,13 +201,44 @@ export class DecalTool {
   addArtwork(text: string, fileName: string): { artwork: Artwork | null; notices: string[] } {
     const id = 'a' + String(this.nextArtwork);
     this.nextArtwork = this.nextArtwork + 1;
+    return this.readArtwork(id, text, fileName, true);
+  }
+
+  // Artwork from a project, under the id it had. `listed`: shown in the
+  // artwork list (artwork replaced by an edited file is kept, unlisted,
+  // for undo).
+  restoreArtwork(id: string, text: string, fileName: string, listed: boolean): { artwork: Artwork | null; notices: string[] } {
+    const number = parseInt(id.replace(/\D/g, ''), 10);
+    if (Number.isFinite(number) && number >= this.nextArtwork) {
+      this.nextArtwork = number + 1;
+    }
+    return this.readArtwork(id, text, fileName, listed);
+  }
+
+  private readArtwork(id: string, text: string, fileName: string, listed: boolean): { artwork: Artwork | null; notices: string[] } {
     const name = fileName.replace(/\.svg$/i, '');
     const result = importSvg(text, name, id);
     if (result.artwork !== null) {
       this.artworks.set(id, result.artwork);
-      this.artworkOrder.push(id);
+      this.artworkSources.set(id, { fileName: fileName, text: text });
+      if (listed) {
+        this.artworkOrder.push(id);
+      }
     }
     return { artwork: result.artwork, notices: result.notices };
+  }
+
+  // Forget all artwork and decal state (New, or a project opened).
+  reset(): void {
+    this.held = null;
+    this.drag = null;
+    this.handleDrag = null;
+    this.heldGrid = null;
+    this.selectedId = null;
+    this.artworks.clear();
+    this.artworkSources.clear();
+    this.artworkOrder.length = 0;
+    this.nextArtwork = 1;
   }
 
   requireArtwork(id: string): Artwork {
@@ -233,17 +271,17 @@ export class DecalTool {
       height: artwork.height * scaleY,
       colourMap: colourMap,
     });
-    this.editor.commitDocument(next, null);
+    this.editor.commitDocument(this.linked(next, decalId), null);
   }
 
   // ---------------------------------------------------------------------------
   // The surface.
 
   private meshOf(part: Part): SurfaceMesh {
-    let mesh = this.meshes.get(part.id);
+    let mesh = this.meshes.get(part);
     if (mesh === undefined) {
       mesh = buildSurfaceMesh(part);
-      this.meshes.set(part.id, mesh);
+      this.meshes.set(part, mesh);
     }
     return mesh;
   }
@@ -303,6 +341,25 @@ export class DecalTool {
 
   isHolding(): boolean {
     return this.held !== null;
+  }
+
+  // The decals being dragged or handled right now (with their linked copies).
+  movingIds(): Set<string> {
+    const ids = new Set<string>();
+    let id: string | null = null;
+    if (this.drag !== null) {
+      id = this.drag.decalId;
+    } else if (this.handleDrag !== null) {
+      id = this.handleDrag.decalId;
+    }
+    if (id === null || findDecal(this.editor.document, id) === null) {
+      return ids;
+    }
+    const members = decalGroup(this.editor.document, id);
+    for (let i = 0; i < members.length; i++) {
+      ids.add(members[i].id);
+    }
+    return ids;
   }
 
   heldArtworkId(): string | null {
@@ -429,6 +486,7 @@ export class DecalTool {
       hidden: false,
       locked: false,
       colourMap: {},
+      symmetry: null,
     };
   }
 
@@ -649,6 +707,7 @@ export class DecalTool {
     template.name = decal.name + ' copy';
     template.locked = false;
     template.hidden = false;
+    template.symmetry = null;
     this.held = { artworkId: decal.artworkId, template: template, frame: null };
     this.selectedId = null;
     this.editor.decalHoldStarted();
@@ -808,7 +867,7 @@ export class DecalTool {
       this.editor.redraw();
       return true;
     }
-    const next = updateDecal(drag.before, drag.decalId, drag.latest);
+    const next = this.linked(updateDecal(drag.before, drag.decalId, drag.latest), drag.decalId);
     const surface = this.surfaceFor(drag.before);
     const startFrame = frameOf(surface, drag.start.anchor, drag.start.rotation);
     const endFrame = frameOf(surface, drag.latest.anchor, drag.latest.rotation);
@@ -829,6 +888,15 @@ export class DecalTool {
     if (drag === null) {
       return;
     }
+    const started = performance.now();
+    this.dragStep(drag, clientX, clientY);
+    this.dragStepTimes.push(performance.now() - started);
+    if (this.dragStepTimes.length > 400) {
+      this.dragStepTimes.shift();
+    }
+  }
+
+  private dragStep(drag: Drag, clientX: number, clientY: number): void {
     const surface = this.surfaceFor(drag.before);
     const at = drag.pointer.surfaceUnder(clientX, clientY);
     if (at === null) {
@@ -868,7 +936,7 @@ export class DecalTool {
     }
     const stored = anchorOf(surface, anchorFrame);
     drag.latest = { anchor: stored.anchor, rotation: stored.rotation };
-    this.editor.previewDocument(updateDecal(drag.before, drag.decalId, drag.latest));
+    this.editor.previewDocument(this.linked(updateDecal(drag.before, drag.decalId, drag.latest), drag.decalId));
   }
 
   private startHandleDrag(pointer: DecalPointer, handle: Handle, clientX: number, clientY: number): void {
@@ -970,7 +1038,7 @@ export class DecalTool {
       text = formatDegrees((rotation * 180) / Math.PI);
     }
     drag.pointer.showLabel(clientX, clientY, text);
-    this.editor.previewDocument(updateDecal(drag.before, drag.decalId, drag.latest));
+    this.editor.previewDocument(this.linked(updateDecal(drag.before, drag.decalId, drag.latest), drag.decalId));
   }
 
   private finishHandleDrag(): void {
@@ -983,7 +1051,7 @@ export class DecalTool {
       this.editor.redraw();
       return;
     }
-    const next = updateDecal(drag.before, drag.decalId, drag.latest);
+    const next = this.linked(updateDecal(drag.before, drag.decalId, drag.latest), drag.decalId);
     const decal = requireDecal(next, drag.decalId);
     let operation: LastOperation;
     if (drag.handle === 'scale') {
@@ -995,6 +1063,18 @@ export class DecalTool {
       operation = { kind: 'decal-rotate', decalId: drag.decalId, before: drag.before, start: drag.start, degrees: degrees };
     }
     this.editor.commitDocument(next, operation);
+  }
+
+  // Undo or redo: let go of anything held or dragged, keep the selection.
+  cancelActive(): void {
+    if (this.cancelHeld()) {
+      return;
+    }
+    if (this.handleDrag !== null) {
+      this.handleDrag.pointer.hideLabel();
+    }
+    this.drag = null;
+    this.handleDrag = null;
   }
 
   // Escape or right click.
@@ -1035,7 +1115,9 @@ export class DecalTool {
     }
     const id = this.selectedId;
     this.selectedId = null;
-    this.editor.commitDocument(removeDecal(this.editor.document, id), null);
+    // A linked set goes as a whole (as in KSP); "make unique" first to
+    // remove one copy.
+    this.editor.commitDocument(removeDecalGroup(this.editor.document, id), null);
     return true;
   }
 
@@ -1045,9 +1127,9 @@ export class DecalTool {
     }
     const decal = requireDecal(this.editor.document, this.selectedId);
     if (axis === 'x') {
-      this.editor.commitDocument(updateDecal(this.editor.document, decal.id, { flipX: !decal.flipX }), null);
+      this.editor.commitDocument(this.linked(updateDecal(this.editor.document, decal.id, { flipX: !decal.flipX }), decal.id), null);
     } else {
-      this.editor.commitDocument(updateDecal(this.editor.document, decal.id, { flipY: !decal.flipY }), null);
+      this.editor.commitDocument(this.linked(updateDecal(this.editor.document, decal.id, { flipY: !decal.flipY }), decal.id), null);
     }
   }
 
@@ -1058,10 +1140,109 @@ export class DecalTool {
     this.editor.commitDocument(result.doc, null);
   }
 
+  // An edit of one decal, carried to its linked copies.
+  private linked(doc: AssemblyDocument, id: string): AssemblyDocument {
+    return syncDecalGroup(doc, this.surfaceFor(doc), id);
+  }
+
+  // Symmetry of the selected decal (the toolbar): its set's settings, and
+  // how many copies there are; null when nothing is selected.
+  selectedSymmetry(): { count: number; mirror: boolean; flipMirror: boolean; members: number; onFin: number } | null {
+    if (this.selectedId === null) {
+      return null;
+    }
+    const doc = this.editor.document;
+    const decal = findDecal(doc, this.selectedId);
+    if (decal === null) {
+      return null;
+    }
+    // A fin of a part symmetry set: how many fins there are.
+    let onFin = 0;
+    const placed = findPlaced(doc, decal.anchor.placedId);
+    if (placed !== null && placed.symmetry !== null) {
+      onFin = symmetryMembers(doc, placed.id).length;
+    }
+    const members = decalGroup(doc, decal.id).length;
+    if (decal.symmetry === null) {
+      return { count: 1, mirror: false, flipMirror: false, members: members, onFin: onFin };
+    }
+    return { count: decal.symmetry.count, mirror: decal.symmetry.mirror, flipMirror: decal.symmetry.flipMirror, members: members, onFin: onFin };
+  }
+
+  // Make the selected decal's set again with these settings.
+  private resymmetrise(count: number, mirror: boolean, flipMirror: boolean): void {
+    if (this.selectedId === null) {
+      return;
+    }
+    const doc = this.editor.document;
+    const result = setDecalSymmetry(doc, this.surfaceFor(doc), this.selectedId, count, mirror, flipMirror);
+    this.editor.commitDocument(result.doc, null);
+    if (result.made < result.wanted) {
+      this.editor.report(String(result.wanted - result.made) + ' of the copies found no surface to go on.');
+    }
+  }
+
+  // ×N: step through 1, 2, 3, 4, 6, 8 copies round the rocket.
+  stepSymmetry(direction: number): void {
+    const current = this.selectedSymmetry();
+    if (current === null) {
+      return;
+    }
+    let index = decalSymmetryChoices.indexOf(current.count);
+    if (index < 0) {
+      index = 0;
+    }
+    index = (index + direction + decalSymmetryChoices.length) % decalSymmetryChoices.length;
+    this.resymmetrise(decalSymmetryChoices[index], current.mirror, current.flipMirror);
+  }
+
+  setSymmetryCount(count: number): void {
+    const current = this.selectedSymmetry();
+    if (current === null || count < 1) {
+      return;
+    }
+    this.resymmetrise(count, current.mirror, current.flipMirror);
+  }
+
+  toggleMirror(): void {
+    const current = this.selectedSymmetry();
+    if (current === null) {
+      return;
+    }
+    this.resymmetrise(current.count, !current.mirror, current.flipMirror);
+  }
+
+  toggleFlipMirror(): void {
+    const current = this.selectedSymmetry();
+    if (current === null || !current.mirror) {
+      return;
+    }
+    this.resymmetrise(current.count, true, !current.flipMirror);
+  }
+
+  // On a fin of a fin set: a copy on every fin, at the same place on the
+  // same side (and on the other side too if mirror is on).
+  onEveryFin(): void {
+    const current = this.selectedSymmetry();
+    if (current === null || current.onFin < 2) {
+      return;
+    }
+    this.resymmetrise(current.onFin, current.mirror, current.flipMirror);
+  }
+
+  // Take the selected copy out of its set.
+  makeUnique(): void {
+    if (this.selectedId === null) {
+      return;
+    }
+    this.editor.commitDocument(makeDecalUnique(this.editor.document, this.selectedId), null);
+  }
+
   // Layers and colours (the decal list).
 
-  setLayer(id: string, index: number): void {
-    this.editor.commitDocument(moveDecalLayer(this.editor.document, id, index), null);
+  // A new layer order (bottom first, every decal once).
+  setLayers(bottomFirst: string[]): void {
+    this.editor.commitDocument(reorderDecals(this.editor.document, bottomFirst), null);
   }
 
   toggleHidden(id: string): void {
@@ -1069,7 +1250,7 @@ export class DecalTool {
     if (!decal.hidden && this.selectedId === id) {
       this.selectedId = null;
     }
-    this.editor.commitDocument(updateDecal(this.editor.document, id, { hidden: !decal.hidden }), null);
+    this.editor.commitDocument(this.linked(updateDecal(this.editor.document, id, { hidden: !decal.hidden }), id), null);
   }
 
   toggleLocked(id: string): void {
@@ -1077,7 +1258,7 @@ export class DecalTool {
     if (!decal.locked && this.selectedId === id) {
       this.selectedId = null;
     }
-    this.editor.commitDocument(updateDecal(this.editor.document, id, { locked: !decal.locked }), null);
+    this.editor.commitDocument(this.linked(updateDecal(this.editor.document, id, { locked: !decal.locked }), id), null);
   }
 
   rename(id: string, name: string): void {
@@ -1087,11 +1268,11 @@ export class DecalTool {
       this.editor.notify();
       return;
     }
-    this.editor.commitDocument(updateDecal(this.editor.document, id, { name: trimmed }), null);
+    this.editor.commitDocument(this.linked(updateDecal(this.editor.document, id, { name: trimmed }), id), null);
   }
 
   setColour(id: string, artworkColour: string, vinyl: string): void {
-    this.editor.commitDocument(setDecalColour(this.editor.document, id, artworkColour, vinyl), null);
+    this.editor.commitDocument(this.linked(setDecalColour(this.editor.document, id, artworkColour, vinyl), id), null);
   }
 
   setPartColour(placedId: string, colour: string | null): void {
@@ -1128,7 +1309,7 @@ export class DecalTool {
       return false;
     }
     const stored = anchorOf(surface, frame);
-    this.editor.commitDocument(updateDecal(doc, this.selectedId, { anchor: stored.anchor, rotation: stored.rotation }), null);
+    this.editor.commitDocument(this.linked(updateDecal(doc, this.selectedId, { anchor: stored.anchor, rotation: stored.rotation }), this.selectedId), null);
     return true;
   }
 
@@ -1150,12 +1331,12 @@ export class DecalTool {
         return null;
       }
       const stored = anchorOf(surface, moved);
-      return updateDecal(operation.before, operation.decalId, { anchor: stored.anchor, rotation: stored.rotation });
+      return this.linked(updateDecal(operation.before, operation.decalId, { anchor: stored.anchor, rotation: stored.rotation }), operation.decalId);
     }
     if (operation.kind === 'decal-rotate') {
       operation.degrees = values[0];
       const rotation = (values[0] * Math.PI) / 180;
-      return updateDecal(operation.before, operation.decalId, { rotation: rotation });
+      return this.linked(updateDecal(operation.before, operation.decalId, { rotation: rotation }), operation.decalId);
     }
     if (operation.kind === 'decal-scale') {
       if (!(values[0] > 0) || !(values[1] > 0)) {
@@ -1163,7 +1344,7 @@ export class DecalTool {
       }
       operation.width = values[0];
       operation.height = values[1];
-      return updateDecal(operation.before, operation.decalId, { width: values[0], height: values[1] });
+      return this.linked(updateDecal(operation.before, operation.decalId, { width: values[0], height: values[1] }), operation.decalId);
     }
     return null;
   }
@@ -1195,6 +1376,21 @@ export class DecalTool {
     for (let i = 0; i < this.handlePoints.length; i++) {
       const screen = this.editor.view.toScreen(this.handlePoints[i].point);
       result.push({ handle: this.handlePoints[i].handle, x: screen.x, y: screen.y });
+    }
+    return result;
+  }
+
+  // The drawn decals in layer order, mesh and texture, for the model export.
+  visibleMeshes(): Array<{ geometry: THREE.BufferGeometry; texture: THREE.Texture | null }> {
+    const result: Array<{ geometry: THREE.BufferGeometry; texture: THREE.Texture | null }> = [];
+    const doc = this.editor.document;
+    for (let i = 0; i < doc.decals.length; i++) {
+      const visual = this.visuals.get(doc.decals[i].id);
+      if (visual === undefined || !visual.mesh.visible) {
+        continue;
+      }
+      const material = visual.mesh.material as THREE.MeshStandardMaterial;
+      result.push({ geometry: visual.mesh.geometry, texture: material.map });
     }
     return result;
   }

@@ -4,6 +4,7 @@
 
 import type { Editor, LastOperation, Tool } from './editor.ts';
 import type { PresetView } from './view.ts';
+import type { PagePane } from './page-pane.ts';
 import type { AssemblyDocument, PlacedPart } from '../model/document.ts';
 import { symmetryMembers } from '../model/document.ts';
 import { renderThumbnail } from './thumbnails.ts';
@@ -12,6 +13,7 @@ import type { ColourChoice } from './decal-panels.ts';
 import { presetVinyl } from '../model/decals.ts';
 import { drawArtwork } from './decal-visuals.ts';
 import type { Artwork } from '../geometry/artwork.ts';
+import type { ReattachReport } from '../model/replace-part.ts';
 
 // Stroke icons, 20 x 20 view box.
 const icons: Record<string, string> = {
@@ -27,6 +29,7 @@ const icons: Record<string, string> = {
   plus: '<path d="M10 4v12M4 10h12"/>',
   flipX: '<path d="M10 3v14" stroke-dasharray="2 2"/><path d="M7 6L3 10l4 4zM13 6l4 4-4 4z"/>',
   flipY: '<path d="M3 10h14" stroke-dasharray="2 2"/><path d="M6 7l4-4 4 4zM6 13l4 4 4-4z"/>',
+  replace: '<path d="M4 8a6 6 0 0 1 11-2M16 12a6 6 0 0 1-11 2"/><path d="M15 2.5V6h-3.5M5 17.5V14h3.5"/>',
 };
 
 function icon(name: string): string {
@@ -48,6 +51,15 @@ interface PendingFile {
   name: string;
 }
 
+// What the panels ask the rest of the app to do with files.
+export interface UiActions {
+  openFiles(files: File[]): void;
+  save(): void;
+  newProject(): void;
+  // Replace the part a placed part is made from by a revised STEP file.
+  replacePart(placedId: string, file: File): void;
+}
+
 export class Ui {
   private readonly editor: Editor;
   private readonly root: HTMLElement;
@@ -64,42 +76,90 @@ export class Ui {
   private readonly noticeText: HTMLElement;
   private readonly replaceInput: HTMLInputElement;
   private replaceTarget: string | null = null;
-  private readonly artThumbnails = new Map<string, string>();
+  private readonly artThumbnails = new WeakMap<object, string>();
   private readonly adjust: HTMLElement;
   private readonly empty: HTMLElement;
   private readonly toast: HTMLElement;
   private readonly fileInput: HTMLInputElement;
   private readonly toolButtons = new Map<Tool, HTMLButtonElement>();
   private readonly symmetryButton: HTMLButtonElement;
+  private readonly decalButtons = new Map<string, HTMLButtonElement>();
   private readonly undoButton: HTMLButtonElement;
   private readonly redoButton: HTMLButtonElement;
-  private readonly thumbnails = new Map<string, string>();
+  // By object, not id: a project opened later may reuse an id.
+  private readonly thumbnails = new WeakMap<object, string>();
+  private readonly actions: UiActions;
+  private readonly openInput: HTMLInputElement;
+  private readonly stepInput: HTMLInputElement;
+  private replacePartTarget: string | null = null;
+  private readonly newButton: HTMLButtonElement;
+  private newArmedTimer = 0;
+  // The two halves of the left column, folded away or not.
+  private partsFolded = false;
+  private artFolded = false;
   private readonly pending: PendingFile[] = [];
   private adjustFor: LastOperation | null = null;
   private readonly adjustInputs: HTMLInputElement[] = [];
   private toastTimer = 0;
   private refreshQueued = false;
 
-  constructor(root: HTMLElement, editor: Editor, openFiles: (files: File[]) => void) {
+  constructor(root: HTMLElement, editor: Editor, pagePane: PagePane, actions: UiActions) {
     this.editor = editor;
     this.root = root;
+    this.actions = actions;
+    const openFiles = actions.openFiles;
     const self = this;
+    this.partsFolded = readFlag('dc6.partsFolded');
+    this.artFolded = readFlag('dc6.artFolded');
 
     this.fileInput = element('input', '', root);
     this.fileInput.type = 'file';
     this.fileInput.multiple = true;
-    this.fileInput.accept = '.step,.stp,.STEP,.STP,.svg,.SVG';
+    this.fileInput.accept = '.step,.stp,.STEP,.STP,.svg,.SVG,.dc6';
     this.fileInput.style.display = 'none';
     this.fileInput.addEventListener('change', function picked() {
       const files = Array.from(self.fileInput.files ?? []);
       self.fileInput.value = '';
       openFiles(files);
     });
+    this.fileInput.dataset.input = 'add';
+
+    // Open a project, and a revised STEP file for a part.
+    this.openInput = element('input', '', root);
+    this.openInput.type = 'file';
+    this.openInput.accept = '.dc6';
+    this.openInput.style.display = 'none';
+    this.openInput.dataset.input = 'open';
+    this.openInput.addEventListener('change', function picked() {
+      const files = Array.from(self.openInput.files ?? []);
+      self.openInput.value = '';
+      openFiles(files);
+    });
+    this.stepInput = element('input', '', root);
+    this.stepInput.type = 'file';
+    this.stepInput.accept = '.step,.stp,.STEP,.STP';
+    this.stepInput.style.display = 'none';
+    this.stepInput.dataset.input = 'replace-part';
+    this.stepInput.addEventListener('change', function picked() {
+      const files = Array.from(self.stepInput.files ?? []);
+      self.stepInput.value = '';
+      const target = self.replacePartTarget;
+      self.replacePartTarget = null;
+      if (files.length > 0 && target !== null) {
+        actions.replacePart(target, files[0]);
+      }
+    });
 
     // Empty state: the only thing on screen until a file arrives.
     this.empty = element('div', 'empty', root);
     const emptyTitle = element('div', 'empty-title', this.empty);
     emptyTitle.textContent = 'Drop STEP and SVG files here';
+    const emptyOpen = element('button', 'link', this.empty);
+    emptyOpen.textContent = 'or open a project';
+    emptyOpen.dataset.control = 'open-empty';
+    emptyOpen.addEventListener('click', function openProject() {
+      self.openInput.click();
+    });
     const choose = element('button', 'link', this.empty);
     choose.textContent = 'or choose files';
     choose.addEventListener('click', function chooseFiles() {
@@ -153,6 +213,30 @@ export class Ui {
         editor.decals.flipSelected(axis);
       });
     }
+    // Decal symmetry, beside the flips (the ×N button is shared with parts).
+    const decalCommands: Array<[string, string, string, () => void]> = [
+      ['decal-mirror', 'Mirror', 'A mirror image on the other side (M)', function mirror() {
+        editor.decals.toggleMirror();
+      }],
+      ['decal-flip-mirror', 'Flip image', 'Mirror images show the artwork mirrored', function flipImage() {
+        editor.decals.toggleFlipMirror();
+      }],
+      ['decal-every-fin', 'Every fin', 'A copy on every fin of the set, same place, same side', function everyFin() {
+        editor.decals.onEveryFin();
+      }],
+      ['decal-unique', 'Make unique', 'Unlink this copy from the others', function unique() {
+        editor.decals.makeUnique();
+      }],
+    ];
+    for (let i = 0; i < decalCommands.length; i++) {
+      const command = decalCommands[i];
+      const button = element('button', 'tool text words', this.decalGroup);
+      button.textContent = command[1];
+      button.title = command[2];
+      button.dataset.control = command[0];
+      button.addEventListener('click', command[3]);
+      this.decalButtons.set(command[0], button);
+    }
     const history = element('div', 'group', this.topbar);
     this.undoButton = element('button', 'tool', history);
     this.undoButton.innerHTML = icon('undo');
@@ -167,6 +251,29 @@ export class Ui {
       editor.redo();
     });
     element('div', 'spacer', this.topbar);
+    // The project: as KSP's editor, three plain buttons.
+    const files = element('div', 'group', this.topbar);
+    this.newButton = element('button', 'view', files);
+    this.newButton.textContent = 'New';
+    this.newButton.title = 'Start again (cannot be undone)';
+    this.newButton.dataset.control = 'new';
+    this.newButton.addEventListener('click', function startAgain() {
+      self.newClicked();
+    });
+    const openButton = element('button', 'view', files);
+    openButton.textContent = 'Open';
+    openButton.title = 'Open a project (Ctrl+O)';
+    openButton.dataset.control = 'open';
+    openButton.addEventListener('click', function openProject() {
+      self.openInput.click();
+    });
+    const saveButton = element('button', 'view', files);
+    saveButton.textContent = 'Save';
+    saveButton.title = 'Save the project as one .dc6 file (Ctrl+S)';
+    saveButton.dataset.control = 'save';
+    saveButton.addEventListener('click', function saveProject() {
+      actions.save();
+    });
     this.exportGroup = element('div', 'group', this.topbar);
     const exportButton = element('button', 'view', this.exportGroup);
     exportButton.textContent = 'Export';
@@ -220,7 +327,7 @@ export class Ui {
       self.replaceTarget = decalId;
       self.replaceInput.click();
     });
-    this.exportDialog = new ExportDialog(root, editor);
+    this.exportDialog = new ExportDialog(root, editor, pagePane);
     exportButton.addEventListener('click', function openExport() {
       self.exportDialog.toggle(exportButton);
     });
@@ -270,6 +377,23 @@ export class Ui {
       changed: function changed() {
         self.queueRefresh();
       },
+    });
+    editor.onReport(function reported(text: string) {
+      self.showError(text);
+    });
+    window.addEventListener('keydown', function fileKeys(event) {
+      const command = event.ctrlKey || event.metaKey;
+      if (!command) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === 's') {
+        event.preventDefault();
+        actions.save();
+      } else if (key === 'o') {
+        event.preventDefault();
+        self.openInput.click();
+      }
     });
     this.refresh();
   }
@@ -346,10 +470,30 @@ export class Ui {
     this.toolButtons.forEach(function mark(button, tool) {
       button.classList.toggle('active', editor.tool === tool);
     });
-    this.symmetryButton.textContent = '×' + String(editor.symmetryCount);
-    this.symmetryButton.classList.toggle('active', editor.symmetryCount > 1);
-    this.decalGroup.style.display = editor.decals.selectedId !== null ? '' : 'none';
-    this.exportGroup.style.display = editor.document.decals.length > 0 ? '' : 'none';
+    const decalSymmetry = editor.decals.selectedSymmetry();
+    if (decalSymmetry !== null) {
+      // A decal is selected: ×N is its copies round the rocket.
+      this.symmetryButton.textContent = '×' + String(decalSymmetry.count);
+      this.symmetryButton.classList.toggle('active', decalSymmetry.count > 1);
+      this.symmetryButton.title = 'Copies of the decal round the rocket (X, Shift+X)';
+    } else {
+      this.symmetryButton.textContent = '×' + String(editor.symmetryCount);
+      this.symmetryButton.classList.toggle('active', editor.symmetryCount > 1);
+      this.symmetryButton.title = 'Symmetry (X, Shift+X)';
+    }
+    this.decalGroup.style.display = decalSymmetry !== null ? '' : 'none';
+    if (decalSymmetry !== null) {
+      const mirror = this.decalButtons.get('decal-mirror') as HTMLButtonElement;
+      mirror.classList.toggle('active', decalSymmetry.mirror);
+      const flipImage = this.decalButtons.get('decal-flip-mirror') as HTMLButtonElement;
+      flipImage.style.display = decalSymmetry.mirror ? '' : 'none';
+      flipImage.classList.toggle('active', decalSymmetry.flipMirror);
+      const everyFin = this.decalButtons.get('decal-every-fin') as HTMLButtonElement;
+      everyFin.style.display = decalSymmetry.onFin > 1 && decalSymmetry.count !== decalSymmetry.onFin ? '' : 'none';
+      const unique = this.decalButtons.get('decal-unique') as HTMLButtonElement;
+      unique.style.display = decalSymmetry.members > 1 ? '' : 'none';
+    }
+    this.exportGroup.style.display = editor.document.placed.length > 0 ? '' : 'none';
     this.undoButton.disabled = !editor.history.canUndo();
     this.redoButton.disabled = !editor.history.canRedo();
 
@@ -362,9 +506,22 @@ export class Ui {
   private refreshBin(): void {
     const editor = this.editor;
     const list = this.binList;
+    const self = this;
     list.textContent = '';
+    const decals = editor.decals;
+    // Two halves, each under a heading that folds it away.
+    const hasParts = editor.partOrder.length > 0 || this.pending.length > 0;
+    const hasArt = decals.artworkOrder.length > 0;
+    if (hasParts && hasArt) {
+      this.binHeading(list, 'Parts', 'parts', this.partsFolded, editor.partOrder.length + this.pending.length, function fold() {
+        self.partsFolded = !self.partsFolded;
+        writeFlag('dc6.partsFolded', self.partsFolded);
+        self.refresh();
+      });
+    }
     const heldPart = editor.heldPartId();
-    for (let i = 0; i < editor.partOrder.length; i++) {
+    const showParts = !(hasParts && hasArt && this.partsFolded);
+    for (let i = 0; i < editor.partOrder.length && showParts; i++) {
       const partId = editor.partOrder[i];
       const part = editor.parts.get(partId);
       if (part === undefined) {
@@ -375,10 +532,10 @@ export class Ui {
       item.dataset.partName = part.name;
       item.title = part.name;
       item.classList.toggle('held', heldPart === partId && editor.isHolding());
-      let url = this.thumbnails.get(partId);
+      let url = this.thumbnails.get(part);
       if (url === undefined) {
         url = renderThumbnail(part, editor.holdingTransform(partId));
-        this.thumbnails.set(partId, url);
+        this.thumbnails.set(part, url);
       }
       const image = element('img', '', item);
       image.src = url;
@@ -394,20 +551,24 @@ export class Ui {
         editor.pickNew(partId);
       });
     }
-    for (let i = 0; i < this.pending.length; i++) {
+    for (let i = 0; i < this.pending.length && showParts; i++) {
       const item = element('div', 'bin-item loading', list);
       element('div', 'bin-placeholder', item);
       const label = element('div', 'bin-name', item);
-      label.textContent = this.pending[i].name.replace(/\.(step|stp)$/i, '');
+      label.textContent = this.pending[i].name.replace(/\.(step|stp|dc6)$/i, '');
     }
     // The imported artwork, below the parts: click one and it follows the
     // cursor over the rocket, stuck to the surface, until a click drops it.
-    const decals = editor.decals;
-    if (decals.artworkOrder.length > 0 && editor.partOrder.length > 0) {
-      element('div', 'bin-rule', list);
+    if (hasParts && hasArt) {
+      this.binHeading(list, 'Artwork', 'artwork', this.artFolded, decals.artworkOrder.length, function fold() {
+        self.artFolded = !self.artFolded;
+        writeFlag('dc6.artFolded', self.artFolded);
+        self.refresh();
+      });
     }
+    const showArt = !(hasParts && hasArt && this.artFolded);
     const heldArt = decals.heldArtworkId();
-    for (let i = 0; i < decals.artworkOrder.length; i++) {
+    for (let i = 0; i < decals.artworkOrder.length && showArt; i++) {
       const artworkId = decals.artworkOrder[i];
       const artwork = decals.requireArtwork(artworkId);
       const item = element('div', 'bin-item art-item', list);
@@ -415,10 +576,10 @@ export class Ui {
       item.dataset.artworkName = artwork.name;
       item.title = artwork.name + ' · ' + artwork.width.toFixed(1) + ' × ' + artwork.height.toFixed(1) + ' mm';
       item.classList.toggle('held', heldArt === artworkId);
-      let url = this.artThumbnails.get(artworkId);
+      let url = this.artThumbnails.get(artwork);
       if (url === undefined) {
         url = artworkThumbnail(artwork);
-        this.artThumbnails.set(artworkId, url);
+        this.artThumbnails.set(artwork, url);
       }
       const image = element('img', '', item);
       image.src = url;
@@ -434,6 +595,95 @@ export class Ui {
         decals.pickArtwork(artworkId);
       });
     }
+  }
+
+  // A heading in the left column: its name, a count when folded, and a
+  // click folds or unfolds what is under it.
+  private binHeading(list: HTMLElement, text: string, key: string, folded: boolean, count: number, toggle: () => void): void {
+    const heading = element('button', 'bin-heading', list);
+    heading.dataset.heading = key;
+    heading.classList.toggle('folded', folded);
+    heading.title = folded ? 'Show' : 'Fold away';
+    const arrow = element('span', 'bin-arrow', heading);
+    arrow.textContent = folded ? '▸' : '▾';
+    const name = element('span', '', heading);
+    name.textContent = folded ? text + ' ' + String(count) : text;
+    heading.addEventListener('click', toggle);
+  }
+
+  // New: at once when there is nothing to lose; with work, the first
+  // click asks (the button says so for a few seconds) and a second one
+  // clears. New cannot be undone.
+  private newClicked(): void {
+    const editor = this.editor;
+    const work = editor.partOrder.length > 0 || editor.decals.artworkOrder.length > 0 || editor.document.placed.length > 0;
+    const button = this.newButton;
+    if (!work || button.classList.contains('armed')) {
+      window.clearTimeout(this.newArmedTimer);
+      button.classList.remove('armed');
+      button.textContent = 'New';
+      this.actions.newProject();
+      return;
+    }
+    button.classList.add('armed');
+    button.textContent = 'Discard all?';
+    this.newArmedTimer = window.setTimeout(function disarm() {
+      button.classList.remove('armed');
+      button.textContent = 'New';
+    }, 3000);
+  }
+
+  // After a part was replaced: the decals to check, each a link that
+  // selects it; or, when all landed where they were, a short toast.
+  showReplaceReport(oldName: string, newName: string, report: ReattachReport[]): void {
+    const editor = this.editor;
+    const title = oldName === newName ? oldName + ' replaced.' : oldName + ' replaced by ' + newName + '.';
+    if (report.length === 0) {
+      this.showError(title + ' Every decal on it stayed in place.');
+      return;
+    }
+    // Linked copies that fared the same are one entry, "fin logo ×4".
+    const entries: Array<{ first: ReattachReport; count: number }> = [];
+    for (let i = 0; i < report.length; i++) {
+      let same = null;
+      for (let k = 0; k < entries.length; k++) {
+        const other = entries[k].first;
+        if (other.name === report[i].name && other.foundNear === report[i].foundNear && Math.abs(other.distance - report[i].distance) < 0.05) {
+          same = entries[k];
+        }
+      }
+      if (same === null) {
+        entries.push({ first: report[i], count: 1 });
+      } else {
+        same.count = same.count + 1;
+      }
+    }
+    this.noticeText.textContent = '';
+    const intro = element('span', '', this.noticeText);
+    intro.textContent = title + ' Check: ';
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i].first;
+      if (i > 0) {
+        const comma = element('span', '', this.noticeText);
+        comma.textContent = '; ';
+      }
+      const link = element('button', 'notice-link', this.noticeText);
+      link.textContent = entries[i].count > 1 ? entry.name + ' ×' + String(entries[i].count) : entry.name;
+      link.dataset.decalId = entry.decalId;
+      link.addEventListener('click', function selectDecal() {
+        editor.decals.select(entry.decalId);
+        editor.notify();
+      });
+      const detail = element('span', 'notice-detail', this.noticeText);
+      if (!Number.isFinite(entry.distance)) {
+        detail.textContent = ' no surface found';
+      } else if (entry.foundNear) {
+        detail.textContent = ' moved ' + entry.distance.toFixed(1) + ' mm';
+      } else {
+        detail.textContent = ' nothing within 10 mm, now ' + entry.distance.toFixed(1) + ' mm away';
+      }
+    }
+    this.notice.style.display = '';
   }
 
   private refreshTree(): void {
@@ -472,6 +722,16 @@ export class Ui {
         popover.open(swatch, partColourChoices(doc), colour === undefined ? null : colour, function chosen(picked) {
           editor.decals.setPartColour(placed.id, picked);
         });
+      });
+      const replace = element('button', 'row-button hover-only', row);
+      replace.innerHTML = icon('replace');
+      replace.title = 'Replace… with a revised STEP file';
+      replace.dataset.action = 'replace-part';
+      const self = this;
+      replace.addEventListener('click', function replacePart(event) {
+        event.stopPropagation();
+        self.replacePartTarget = placed.id;
+        self.stepInput.click();
       });
       const remove = element('button', 'row-button remove', row);
       remove.innerHTML = icon('trash');
@@ -677,6 +937,23 @@ function axisName(axis: 'along' | 'up' | 'side'): string {
     return 'Up';
   }
   return 'Side';
+}
+
+// A remembered yes/no for this viewer (browser storage may be blocked).
+function readFlag(key: string): boolean {
+  try {
+    return window.localStorage.getItem(key) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeFlag(key: string, value: boolean): void {
+  try {
+    window.localStorage.setItem(key, value ? '1' : '0');
+  } catch {
+    // Not remembered; it still works for now.
+  }
 }
 
 function hasFiles(event: DragEvent): boolean {

@@ -10,9 +10,16 @@ import { raycastSurface, worldNormal } from '../src/geometry/geodesic.ts';
 import type { Surface } from '../src/geometry/geodesic.ts';
 import { defaultRight, frameAt, mapDecal, rotateInPlane } from '../src/geometry/decal-map.ts';
 import type { Page, PageView } from '../src/geometry/page.ts';
-import { buildPage, decalPageTriangles, edgeJoint, pageToSurface, surfaceToPage, viewPage } from '../src/geometry/page.ts';
+import { buildPage, decalPageTriangles, edgeJoint, islandGap, pageToSurface, surfaceToPage, viewPage } from '../src/geometry/page.ts';
 import { AFT_DIRECTION } from '../src/geometry/rocket-axis.ts';
 import { assembledRocket, fusedRocket, infoOf } from './rocket.ts';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { Artwork } from '../src/geometry/artwork.ts';
+import { shapesBox } from '../src/geometry/artwork.ts';
+import { importSvg } from '../src/geometry/svg-import.ts';
+import { decalOutlines } from '../src/geometry/page-svg.ts';
 import { rootPart, surfaceOf } from './surfaces.ts';
 import type { Placed } from './surfaces.ts';
 import { loadPart } from './models.ts';
@@ -21,6 +28,10 @@ import { placeRoot } from '../src/geometry/mating.ts';
 import { body, tube as tubeSize } from '../tools/test-model-dimensions.ts';
 
 const report: string[] = [];
+
+function page1(page: Page, piece: number): string {
+  return page.placedIds[piece];
+}
 
 function pageOf(placed: Placed[]): Page {
   const symmetry: Array<number | null> = [];
@@ -294,6 +305,69 @@ describe('the page of the test rocket', () => {
     }
   });
 
+  it('compact: the fin sides lie in one row above and one below the strip, each fin\'s two sides side by side', async () => {
+    const rocket = await assembledRocket('tube');
+    const page = buildPage(rocket.surface, rocket.info);
+    let bandHalf = 0;
+    for (let b = 0; b < page.envelope.length; b++) {
+      bandHalf = Math.max(bandHalf, page.envelope[b]);
+    }
+    let tallest = 0;
+    for (let i = 0; i < page.islands.length; i++) {
+      tallest = Math.max(tallest, page.islands[i].maxY - page.islands[i].minY);
+    }
+    const height = page.maxY - page.minY;
+    report.push('compact page: ' + (page.maxX - page.minX).toFixed(0) + ' x ' + height.toFixed(0) + ' mm (strip band ' + (2 * bandHalf).toFixed(0) + ' mm, tallest island ' + tallest.toFixed(0) + ' mm)');
+    // About the strip band plus one row of islands on each side.
+    expect(height).toBeLessThan(2 * bandHalf + 2 * (tallest + islandGap) + 1e-6);
+    // One row each side: the islands above all start at the same height, and so do those below.
+    const aboveBottoms = new Set<string>();
+    const belowTops = new Set<string>();
+    for (let i = 0; i < page.islands.length; i++) {
+      const island = page.islands[i];
+      if (island.offsetY > 0) {
+        aboveBottoms.add((island.minY + island.offsetY).toFixed(6));
+        expect(island.labelSide).toBe(1);
+      } else {
+        belowTops.add((island.maxY + island.offsetY).toFixed(6));
+        expect(island.labelSide).toBe(-1);
+      }
+    }
+    expect(aboveBottoms.size).toBe(1);
+    expect(belowTops.size).toBe(1);
+    // A fin's two sides are neighbours in their row, left then right, one gap apart.
+    for (let k = 1; k <= 4; k++) {
+      const sides = page.islands.filter((i) => page.placedIds[i.piece] === 'fin' + String(k));
+      expect(sides.length).toBe(2);
+      sides.sort((a, b) => a.offsetX + a.minX - (b.offsetX + b.minX));
+      expect(sides[0].side).toBe('left');
+      expect(sides[1].side).toBe('right');
+      expect(Math.abs(sides[1].offsetX + sides[1].minX - (sides[0].offsetX + sides[0].maxX) - islandGap)).toBeLessThan(1e-6);
+    }
+  });
+
+  it('a part floating beside a fin (not on the body) does not hide the fin\'s sides', async () => {
+    const rocket = await assembledRocket('tube');
+    const plain = buildPage(rocket.surface, rocket.info);
+    const fin1Side = plain.islands.filter((i) => page1(plain, i.piece) === 'fin1')[0];
+    // A copy of fin 1, 12 mm off its side, not attached to anything.
+    const fin1 = rocket.placed.filter((p) => p.id === 'fin1')[0];
+    const offset = fin1Side.normal.map((v) => v * 12) as Vec3;
+    const floating: Placed = { id: 'floating', part: fin1.part, transform: { position: [fin1.transform.position[0] + offset[0], fin1.transform.position[1] + offset[1], fin1.transform.position[2] + offset[2]], rotation: fin1.transform.rotation } };
+    const list = rocket.placed.concat([floating]);
+    const symmetry = rocket.symmetry.concat([null]);
+    const info = infoOf(list, symmetry);
+    info[info.length - 1].onBody = false;
+    const page = buildPage(surfaceOf(list), info);
+    const finSides = page.islands.filter((i) => /^fin\d$/.test(page.placedIds[i.piece]));
+    expect(finSides.length).toBe(8);
+    // Were it on the body it would block that side (the test bites).
+    info[info.length - 1].onBody = true;
+    const blocked = buildPage(surfaceOf(list), info);
+    const blockedSides = blocked.islands.filter((i) => /^fin\d$/.test(blocked.placedIds[i.piece]));
+    expect(blockedSides.length).toBeLessThan(8);
+  });
+
   it('building the page twice gives the same page', async () => {
     const first = await assembledRocket('tube');
     const second = await assembledRocket('tube');
@@ -487,6 +561,59 @@ describe('decals on the page', () => {
     report.push('decal across the seam: ' + String(nearTop) + ' triangles below the top edge of the strip, ' + String(nearBottom) + ' above its bottom edge');
     expect(nearTop).toBeGreaterThan(0);
     expect(nearBottom).toBeGreaterThan(0);
+  });
+
+  it('the artwork goes onto the page as outlines: whole and true to size on the side, broken at the seam', async () => {
+    const rocket = await assembledRocket('tube');
+    const page = buildPage(rocket.surface, rocket.info);
+    const view = viewPage(page, 0);
+    const logo = importSvg(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'test-models', 'art', 'logo.svg'), 'utf8'), 'logo', 'a1').artwork as Artwork;
+    const decal = { width: 40, height: 40, flipX: false, flipY: false, colourMap: {} as Record<string, string> };
+    // On the side facing the viewer, away from everything: closed outlines, as wide as the decal.
+    const side = await decalAt(rocket, [-130, 0, 200], [0, 0, -1], 0, decal.width, decal.height);
+    const shapes = decalOutlines(side, decalPageTriangles(view, side), logo, decal);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let open = 0;
+    let closed = 0;
+    for (let s = 0; s < shapes.length; s++) {
+      for (let k = 0; k < shapes[s].outlines.length; k++) {
+        const outline = shapes[s].outlines[k];
+        if (outline.closed) {
+          closed = closed + 1;
+        } else {
+          open = open + 1;
+        }
+        for (let q = 0; q < outline.points.length; q = q + 2) {
+          minX = Math.min(minX, outline.points[q]);
+          maxX = Math.max(maxX, outline.points[q]);
+        }
+      }
+    }
+    // The logo's outer shape spans its artwork's width.
+    const box = shapesBox(logo.shapes);
+    const expected = ((box.maxX - box.minX) / logo.width) * decal.width;
+    report.push('logo outlines on the page: ' + String(closed) + ' closed, ' + String(open) + ' open; ' + (maxX - minX).toFixed(3) + ' mm across (artwork ' + expected.toFixed(3) + ' mm)');
+    expect(open).toBe(0);
+    expect(closed).toBeGreaterThan(0);
+    expect(Math.abs(maxX - minX - expected)).toBeLessThan(0.1);
+    // Across the seam: drawn on both sides, each side broken where it leaves the band.
+    const back = await decalAt(rocket, [-130, 0, -200], [0, 0, 1], 0.3, 30, 30);
+    const split = decalOutlines(back, decalPageTriangles(view, back), logo, { width: 30, height: 30, flipX: false, flipY: false, colourMap: {} });
+    let above = 0;
+    let below = 0;
+    for (let s = 0; s < split.length; s++) {
+      for (let k = 0; k < split[s].outlines.length; k++) {
+        const y = split[s].outlines[k].points[1];
+        if (y > 0) {
+          above = above + 1;
+        } else {
+          below = below + 1;
+        }
+      }
+    }
+    expect(above).toBeGreaterThan(0);
+    expect(below).toBeGreaterThan(0);
   });
 
   it('a band longer than the circumference shows its overlap on the page', async () => {
