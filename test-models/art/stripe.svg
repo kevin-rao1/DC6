@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DC6 test art: a 300 x 12 mm cerise band (longer than the 207 mm body circumference) with black end marks. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="300mm" height="12mm" viewBox="0 0 300 12">
+  <rect width="300" height="12" fill="#e64097"/>
+  <rect x="0" y="0" width="6" height="12" fill="#000000"/>
+  <rect x="294" y="0" width="6" height="12" fill="#000000"/>
+</svg>
